@@ -15,6 +15,7 @@ type TimeWindowTracker[T any] struct {
 	stopChan      chan struct{}
 	onThreshold   func(key string, entry *TimeWindowEntry[T])
 	logger        Logger
+	cleanupMutex  sync.Mutex // Separate mutex for cleanup operations
 }
 
 // TimeWindowEntry represents an entry in the time window tracker
@@ -25,6 +26,7 @@ type TimeWindowEntry[T any] struct {
 	FirstSeen time.Time
 	LastSeen  time.Time
 	Metadata  map[string]interface{}
+	mutex     sync.RWMutex // Per-entry mutex for fine-grained locking
 }
 
 // TimeWindowConfig configures the time window tracker
@@ -40,6 +42,15 @@ func NewTimeWindowTracker[T any](
 	onThreshold func(key string, entry *TimeWindowEntry[T]),
 	logger Logger,
 ) *TimeWindowTracker[T] {
+	// Set reasonable defaults for cleanup interval
+	cleanupInterval := config.CleanupInterval
+	if cleanupInterval == 0 {
+		cleanupInterval = config.TimeWindow / 2
+		if cleanupInterval < time.Minute {
+			cleanupInterval = time.Minute
+		}
+	}
+
 	return &TimeWindowTracker[T]{
 		entries:     make(map[string]*TimeWindowEntry[T]),
 		timeWindow:  config.TimeWindow,
@@ -59,16 +70,7 @@ func (twt *TimeWindowTracker[T]) Start() {
 
 	twt.cleanupTicker = time.NewTicker(cleanupInterval)
 
-	go func() {
-		for {
-			select {
-			case <-twt.cleanupTicker.C:
-				twt.cleanup()
-			case <-twt.stopChan:
-				return
-			}
-		}
-	}()
+	go twt.cleanupLoop()
 
 	twt.logger.Debug("TimeWindowTracker started",
 		"time_window", twt.timeWindow,
@@ -87,85 +89,155 @@ func (twt *TimeWindowTracker[T]) Stop() {
 
 // Track adds or updates an entry
 func (twt *TimeWindowTracker[T]) Track(key string, data T, metadata map[string]interface{}) bool {
-	twt.mutex.Lock()
-	defer twt.mutex.Unlock()
-
 	now := time.Now()
 
+	// First, try to get existing entry with read lock
+	twt.mutex.RLock()
 	entry, exists := twt.entries[key]
+	twt.mutex.RUnlock()
+
 	if !exists {
-		entry = &TimeWindowEntry[T]{
-			Key:       key,
-			Data:      data,
-			HitCount:  0,
-			FirstSeen: now,
-			Metadata:  make(map[string]interface{}),
+		// Create new entry with write lock
+		twt.mutex.Lock()
+		// Double-check in case another goroutine created it
+		if entry, exists = twt.entries[key]; !exists {
+			entry = &TimeWindowEntry[T]{
+				Key:       key,
+				Data:      data,
+				HitCount:  0,
+				FirstSeen: now,
+				Metadata:  make(map[string]interface{}),
+			}
+			twt.entries[key] = entry
 		}
-		twt.entries[key] = entry
+		twt.mutex.Unlock()
 	}
 
-	// Update entry
+	// Update entry with its own mutex
+	entry.mutex.Lock()
 	entry.Data = data
 	entry.LastSeen = now
 	entry.HitCount++
 
-	// Update metadata
+	// Update metadata safely
 	if metadata != nil {
 		for k, v := range metadata {
 			entry.Metadata[k] = v
 		}
 	}
 
-	// Check if threshold is reached
-	if entry.HitCount >= twt.maxHits {
+	// Check threshold
+	thresholdReached := entry.HitCount >= twt.maxHits
+	if thresholdReached {
 		twt.logger.Debug("Threshold reached",
 			"key", key,
 			"hits", entry.HitCount,
 			"max_hits", twt.maxHits)
 
-		// Call threshold callback
-		if twt.onThreshold != nil {
-			go twt.onThreshold(key, entry)
-		}
-
 		// Reset hit count but keep tracking
 		entry.HitCount = 0
-		return true
+	}
+	entry.mutex.Unlock()
+
+	// Call threshold callback outside of locks
+	if thresholdReached && twt.onThreshold != nil {
+		// Create a copy of the entry for the callback to avoid race conditions
+		entryCopy := twt.copyEntry(entry)
+		go twt.onThreshold(key, entryCopy)
 	}
 
-	return false
+	return thresholdReached
+}
+
+// copyEntry creates a safe copy of an entry for callback use
+func (twt *TimeWindowTracker[T]) copyEntry(entry *TimeWindowEntry[T]) *TimeWindowEntry[T] {
+	entry.mutex.RLock()
+	defer entry.mutex.RUnlock()
+
+	// Create a copy of metadata
+	metadataCopy := make(map[string]interface{})
+	for k, v := range entry.Metadata {
+		metadataCopy[k] = v
+	}
+
+	return &TimeWindowEntry[T]{
+		Key:       entry.Key,
+		Data:      entry.Data,
+		HitCount:  entry.HitCount,
+		FirstSeen: entry.FirstSeen,
+		LastSeen:  entry.LastSeen,
+		Metadata:  metadataCopy,
+	}
 }
 
 // Get retrieves an entry
 func (twt *TimeWindowTracker[T]) Get(key string) (*TimeWindowEntry[T], bool) {
 	twt.mutex.RLock()
-	defer twt.mutex.RUnlock()
-
 	entry, exists := twt.entries[key]
+	twt.mutex.RUnlock()
+
 	if !exists {
 		return nil, false
 	}
 
 	// Check if entry is still valid
-	if time.Since(entry.LastSeen) > twt.timeWindow {
+	entry.mutex.RLock()
+	isValid := time.Since(entry.LastSeen) <= twt.timeWindow
+	entryCopy := twt.copyEntryUnlocked(entry)
+	entry.mutex.RUnlock()
+
+	if !isValid {
 		return nil, false
 	}
 
-	return entry, true
+	return entryCopy, true
+}
+
+// copyEntryUnlocked creates a copy without locking (assumes caller has lock)
+func (twt *TimeWindowTracker[T]) copyEntryUnlocked(entry *TimeWindowEntry[T]) *TimeWindowEntry[T] {
+	metadataCopy := make(map[string]interface{})
+	for k, v := range entry.Metadata {
+		metadataCopy[k] = v
+	}
+
+	return &TimeWindowEntry[T]{
+		Key:       entry.Key,
+		Data:      entry.Data,
+		HitCount:  entry.HitCount,
+		FirstSeen: entry.FirstSeen,
+		LastSeen:  entry.LastSeen,
+		Metadata:  metadataCopy,
+	}
 }
 
 // GetAll returns all valid entries
 func (twt *TimeWindowTracker[T]) GetAll() map[string]*TimeWindowEntry[T] {
-	twt.mutex.RLock()
-	defer twt.mutex.RUnlock()
-
 	result := make(map[string]*TimeWindowEntry[T])
 	now := time.Now()
 
-	for key, entry := range twt.entries {
-		if now.Sub(entry.LastSeen) <= twt.timeWindow {
-			result[key] = entry
+	// Get all keys first
+	twt.mutex.RLock()
+	keys := make([]string, 0, len(twt.entries))
+	for key := range twt.entries {
+		keys = append(keys, key)
+	}
+	twt.mutex.RUnlock()
+
+	// Process each entry
+	for _, key := range keys {
+		twt.mutex.RLock()
+		entry, exists := twt.entries[key]
+		twt.mutex.RUnlock()
+
+		if !exists {
+			continue
 		}
+
+		entry.mutex.RLock()
+		if now.Sub(entry.LastSeen) <= twt.timeWindow {
+			result[key] = twt.copyEntryUnlocked(entry)
+		}
+		entry.mutex.RUnlock()
 	}
 
 	return result
@@ -174,48 +246,93 @@ func (twt *TimeWindowTracker[T]) GetAll() map[string]*TimeWindowEntry[T] {
 // Remove removes an entry
 func (twt *TimeWindowTracker[T]) Remove(key string) {
 	twt.mutex.Lock()
-	defer twt.mutex.Unlock()
-
 	delete(twt.entries, key)
+	twt.mutex.Unlock()
+}
+
+// cleanupLoop runs the cleanup process
+func (twt *TimeWindowTracker[T]) cleanupLoop() {
+	for {
+		select {
+		case <-twt.cleanupTicker.C:
+			twt.cleanup()
+		case <-twt.stopChan:
+			return
+		}
+	}
 }
 
 // cleanup removes expired entries
 func (twt *TimeWindowTracker[T]) cleanup() {
-	twt.mutex.Lock()
-	defer twt.mutex.Unlock()
+	twt.cleanupMutex.Lock()
+	defer twt.cleanupMutex.Unlock()
 
 	now := time.Now()
 	cutoff := now.Add(-twt.timeWindow)
-	removedCount := 0
 
+	// First pass: identify expired keys
+	var expiredKeys []string
+
+	twt.mutex.RLock()
 	for key, entry := range twt.entries {
+		entry.mutex.RLock()
 		if entry.LastSeen.Before(cutoff) {
-			delete(twt.entries, key)
-			removedCount++
+			expiredKeys = append(expiredKeys, key)
 		}
+		entry.mutex.RUnlock()
 	}
+	twt.mutex.RUnlock()
 
-	if removedCount > 0 {
+	// Second pass: remove expired entries
+	if len(expiredKeys) > 0 {
+		twt.mutex.Lock()
+		for _, key := range expiredKeys {
+			// Double-check before deletion
+			if entry, exists := twt.entries[key]; exists {
+				entry.mutex.RLock()
+				stillExpired := entry.LastSeen.Before(cutoff)
+				entry.mutex.RUnlock()
+
+				if stillExpired {
+					delete(twt.entries, key)
+				}
+			}
+		}
+		remaining := len(twt.entries)
+		twt.mutex.Unlock()
+
 		twt.logger.Debug("Cleaned up expired entries",
-			"removed", removedCount,
-			"remaining", len(twt.entries))
+			"removed", len(expiredKeys),
+			"remaining", remaining)
 	}
 }
 
 // GetStats returns statistics about the tracker
 func (twt *TimeWindowTracker[T]) GetStats() map[string]interface{} {
 	twt.mutex.RLock()
-	defer twt.mutex.RUnlock()
+	entryCount := len(twt.entries)
 
 	totalHits := 0
 	for _, entry := range twt.entries {
+		entry.mutex.RLock()
 		totalHits += entry.HitCount
+		entry.mutex.RUnlock()
 	}
+	twt.mutex.RUnlock()
 
 	return map[string]interface{}{
-		"active_entries": len(twt.entries),
+		"active_entries": entryCount,
 		"total_hits":     totalHits,
 		"time_window":    twt.timeWindow.Seconds(),
 		"max_hits":       twt.maxHits,
 	}
+}
+
+// Clear removes all entries (useful for testing)
+func (twt *TimeWindowTracker[T]) Clear() {
+	twt.mutex.Lock()
+	twt.entries = make(map[string]*TimeWindowEntry[T])
+	twt.mutex.Unlock()
+
+	twt.logger.Debug("Cleared all entries")
 }

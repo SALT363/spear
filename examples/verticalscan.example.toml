@@ -1,8 +1,8 @@
 [core]
-socket_path = "/var/run/spear.sock"
-plugin_dir = "/usr/lib/spear/plugins"
+socket_path = "./build/spear.sock"
+plugin_dir = "./build/plugins"
 log_level = "debug"
-pid_file = "/var/run/spear.pid"
+pid_file = "./build/spear.pid"
 
 [plugins]
 verticalscan = { enabled = true }

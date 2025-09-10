@@ -419,7 +419,15 @@ func (m *AuthWatchModule) trackAuthEvent(authEvent *AuthEvent) error {
 	// Get existing data or create new
 	var authData *AuthData
 	if entry, exists := m.tracker.Get(trackingKey); exists {
-		authData = entry.Data
+		authData = &AuthData{
+			IP:            entry.Data.IP,
+			User:          entry.Data.User,
+			Service:       entry.Data.Service,
+			SuccessCount:  entry.Data.SuccessCount,
+			FailureCount:  entry.Data.FailureCount,
+			LastEventType: entry.Data.LastEventType,
+			LastRawLine:   entry.Data.LastRawLine,
+		}
 	} else {
 		authData = &AuthData{
 			IP:      authEvent.IP,

@@ -2,337 +2,362 @@ package api
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// TimeWindowTracker manages time-based tracking with automatic cleanup
-type TimeWindowTracker[T any] struct {
-	entries       map[string]*TimeWindowEntry[T]
-	mutex         sync.RWMutex
-	timeWindow    time.Duration
-	maxHits       int
-	cleanupTicker *time.Ticker
+// AsyncTimeWindowTracker manages time-based tracking with async processing
+type AsyncTimeWindowTracker[T any] struct {
+	entries     sync.Map // Using sync.Map for lock-free reads
+	timeWindow  time.Duration
+	maxHits     int
+	onThreshold func(key string, entry *TimeWindowEntry[T])
+	logger      Logger
+
+	// Async processing
+	eventQueue    chan *TrackingEvent[T]
 	stopChan      chan struct{}
-	onThreshold   func(key string, entry *TimeWindowEntry[T])
-	logger        Logger
-	cleanupMutex  sync.Mutex // Separate mutex for cleanup operations
+	workerPool    []*Worker[T]
+	numWorkers    int
+	cleanupTicker *time.Ticker
+
+	// Stats
+	queueSize int64
+	processed int64
+	dropped   int64
 }
 
-// TimeWindowEntry represents an entry in the time window tracker
+// TrackingEvent represents an event to be processed
+type TrackingEvent[T any] struct {
+	Key       string
+	Data      T
+	Metadata  map[string]interface{}
+	Timestamp time.Time
+}
+
+// Worker processes tracking events
+type Worker[T any] struct {
+	id      int
+	tracker *AsyncTimeWindowTracker[T]
+	queue   chan *TrackingEvent[T]
+	stop    chan struct{}
+}
+
+// TimeWindowEntry with atomic operations
 type TimeWindowEntry[T any] struct {
 	Key       string
 	Data      T
-	HitCount  int
+	HitCount  int64 // Using atomic operations
 	FirstSeen time.Time
 	LastSeen  time.Time
-	Metadata  map[string]interface{}
-	mutex     sync.RWMutex // Per-entry mutex for fine-grained locking
+	Metadata  sync.Map // Using sync.Map for metadata
 }
 
-// TimeWindowConfig configures the time window tracker
-type TimeWindowConfig struct {
+// AsyncTimeWindowConfig configures the async tracker
+type AsyncTimeWindowConfig struct {
 	TimeWindow      time.Duration
 	MaxHits         int
 	CleanupInterval time.Duration
+	QueueSize       int // Buffer size for event queue
+	NumWorkers      int // Number of worker goroutines
 }
 
-// NewTimeWindowTracker creates a new time window tracker
-func NewTimeWindowTracker[T any](
-	config TimeWindowConfig,
+// NewAsyncTimeWindowTracker creates a new async time window tracker
+func NewAsyncTimeWindowTracker[T any](
+	config AsyncTimeWindowConfig,
 	onThreshold func(key string, entry *TimeWindowEntry[T]),
 	logger Logger,
-) *TimeWindowTracker[T] {
-	// Set reasonable defaults for cleanup interval
-	cleanupInterval := config.CleanupInterval
-	if cleanupInterval == 0 {
-		cleanupInterval = config.TimeWindow / 2
-		if cleanupInterval < time.Minute {
-			cleanupInterval = time.Minute
+) *AsyncTimeWindowTracker[T] {
+	// Set defaults
+	if config.QueueSize == 0 {
+		config.QueueSize = 10000
+	}
+	if config.NumWorkers == 0 {
+		config.NumWorkers = 4
+	}
+	if config.CleanupInterval == 0 {
+		config.CleanupInterval = config.TimeWindow / 2
+		if config.CleanupInterval < time.Minute {
+			config.CleanupInterval = time.Minute
 		}
 	}
 
-	return &TimeWindowTracker[T]{
-		entries:     make(map[string]*TimeWindowEntry[T]),
+	tracker := &AsyncTimeWindowTracker[T]{
 		timeWindow:  config.TimeWindow,
 		maxHits:     config.MaxHits,
-		stopChan:    make(chan struct{}),
 		onThreshold: onThreshold,
 		logger:      logger,
+		eventQueue:  make(chan *TrackingEvent[T], config.QueueSize),
+		stopChan:    make(chan struct{}),
+		numWorkers:  config.NumWorkers,
 	}
+
+	return tracker
 }
 
-// Start starts the time window tracker
-func (twt *TimeWindowTracker[T]) Start() {
-	cleanupInterval := twt.timeWindow / 2 // Cleanup twice per window
+// Start starts the async tracker
+func (awt *AsyncTimeWindowTracker[T]) Start() {
+	// Start worker pool
+	awt.workerPool = make([]*Worker[T], awt.numWorkers)
+	for i := 0; i < awt.numWorkers; i++ {
+		worker := &Worker[T]{
+			id:      i,
+			tracker: awt,
+			queue:   make(chan *TrackingEvent[T], 100),
+			stop:    make(chan struct{}),
+		}
+		awt.workerPool[i] = worker
+		go worker.run()
+	}
+
+	// Start event dispatcher
+	go awt.eventDispatcher()
+
+	// Start cleanup
+	cleanupInterval := awt.timeWindow / 2
 	if cleanupInterval < time.Minute {
-		cleanupInterval = time.Minute // Minimum 1 minute
+		cleanupInterval = time.Minute
 	}
+	awt.cleanupTicker = time.NewTicker(cleanupInterval)
+	go awt.cleanupLoop()
 
-	twt.cleanupTicker = time.NewTicker(cleanupInterval)
-
-	go twt.cleanupLoop()
-
-	twt.logger.Debug("TimeWindowTracker started",
-		"time_window", twt.timeWindow,
-		"max_hits", twt.maxHits,
-		"cleanup_interval", cleanupInterval)
+	awt.logger.Debug("AsyncTimeWindowTracker started",
+		"workers", awt.numWorkers,
+		"queue_size", cap(awt.eventQueue))
 }
 
-// Stop stops the time window tracker
-func (twt *TimeWindowTracker[T]) Stop() {
-	close(twt.stopChan)
-	if twt.cleanupTicker != nil {
-		twt.cleanupTicker.Stop()
+// Stop stops the async tracker
+func (awt *AsyncTimeWindowTracker[T]) Stop() {
+	close(awt.stopChan)
+
+	// Stop workers
+	for _, worker := range awt.workerPool {
+		close(worker.stop)
 	}
-	twt.logger.Debug("TimeWindowTracker stopped")
+
+	if awt.cleanupTicker != nil {
+		awt.cleanupTicker.Stop()
+	}
+
+	awt.logger.Debug("AsyncTimeWindowTracker stopped")
 }
 
-// Track adds or updates an entry
-func (twt *TimeWindowTracker[T]) Track(key string, data T, metadata map[string]interface{}) bool {
-	now := time.Now()
-
-	// First, try to get existing entry with read lock
-	twt.mutex.RLock()
-	entry, exists := twt.entries[key]
-	twt.mutex.RUnlock()
-
-	if !exists {
-		// Create new entry with write lock
-		twt.mutex.Lock()
-		// Double-check in case another goroutine created it
-		if entry, exists = twt.entries[key]; !exists {
-			entry = &TimeWindowEntry[T]{
-				Key:       key,
-				Data:      data,
-				HitCount:  0,
-				FirstSeen: now,
-				Metadata:  make(map[string]interface{}),
-			}
-			twt.entries[key] = entry
-		}
-		twt.mutex.Unlock()
+// Track adds an event to the queue (non-blocking)
+func (awt *AsyncTimeWindowTracker[T]) Track(key string, data T, metadata map[string]interface{}) bool {
+	event := &TrackingEvent[T]{
+		Key:       key,
+		Data:      data,
+		Metadata:  metadata,
+		Timestamp: time.Now(),
 	}
 
-	// Update entry with its own mutex
-	entry.mutex.Lock()
-	entry.Data = data
-	entry.LastSeen = now
-	entry.HitCount++
-
-	// Update metadata safely
-	if metadata != nil {
-		for k, v := range metadata {
-			entry.Metadata[k] = v
-		}
-	}
-
-	// Check threshold
-	thresholdReached := entry.HitCount >= twt.maxHits
-	if thresholdReached {
-		twt.logger.Debug("Threshold reached",
-			"key", key,
-			"hits", entry.HitCount,
-			"max_hits", twt.maxHits)
-
-		// Reset hit count but keep tracking
-		entry.HitCount = 0
-	}
-	entry.mutex.Unlock()
-
-	// Call threshold callback outside of locks
-	if thresholdReached && twt.onThreshold != nil {
-		// Create a copy of the entry for the callback to avoid race conditions
-		entryCopy := twt.copyEntry(entry)
-		go twt.onThreshold(key, entryCopy)
-	}
-
-	return thresholdReached
-}
-
-// copyEntry creates a safe copy of an entry for callback use
-func (twt *TimeWindowTracker[T]) copyEntry(entry *TimeWindowEntry[T]) *TimeWindowEntry[T] {
-	entry.mutex.RLock()
-	defer entry.mutex.RUnlock()
-
-	// Create a copy of metadata
-	metadataCopy := make(map[string]interface{})
-	for k, v := range entry.Metadata {
-		metadataCopy[k] = v
-	}
-
-	return &TimeWindowEntry[T]{
-		Key:       entry.Key,
-		Data:      entry.Data,
-		HitCount:  entry.HitCount,
-		FirstSeen: entry.FirstSeen,
-		LastSeen:  entry.LastSeen,
-		Metadata:  metadataCopy,
+	select {
+	case awt.eventQueue <- event:
+		atomic.AddInt64(&awt.queueSize, 1)
+		return true
+	default:
+		// Queue is full, drop the event and log
+		atomic.AddInt64(&awt.dropped, 1)
+		awt.logger.Warn("Event queue full, dropping event", "key", key)
+		return false
 	}
 }
 
-// Get retrieves an entry
-func (twt *TimeWindowTracker[T]) Get(key string) (*TimeWindowEntry[T], bool) {
-	twt.mutex.RLock()
-	entry, exists := twt.entries[key]
-	twt.mutex.RUnlock()
+// eventDispatcher distributes events to workers using round-robin
+func (awt *AsyncTimeWindowTracker[T]) eventDispatcher() {
+	workerIndex := 0
 
-	if !exists {
-		return nil, false
-	}
-
-	// Check if entry is still valid
-	entry.mutex.RLock()
-	isValid := time.Since(entry.LastSeen) <= twt.timeWindow
-	entryCopy := twt.copyEntryUnlocked(entry)
-	entry.mutex.RUnlock()
-
-	if !isValid {
-		return nil, false
-	}
-
-	return entryCopy, true
-}
-
-// copyEntryUnlocked creates a copy without locking (assumes caller has lock)
-func (twt *TimeWindowTracker[T]) copyEntryUnlocked(entry *TimeWindowEntry[T]) *TimeWindowEntry[T] {
-	metadataCopy := make(map[string]interface{})
-	for k, v := range entry.Metadata {
-		metadataCopy[k] = v
-	}
-
-	return &TimeWindowEntry[T]{
-		Key:       entry.Key,
-		Data:      entry.Data,
-		HitCount:  entry.HitCount,
-		FirstSeen: entry.FirstSeen,
-		LastSeen:  entry.LastSeen,
-		Metadata:  metadataCopy,
-	}
-}
-
-// GetAll returns all valid entries
-func (twt *TimeWindowTracker[T]) GetAll() map[string]*TimeWindowEntry[T] {
-	result := make(map[string]*TimeWindowEntry[T])
-	now := time.Now()
-
-	// Get all keys first
-	twt.mutex.RLock()
-	keys := make([]string, 0, len(twt.entries))
-	for key := range twt.entries {
-		keys = append(keys, key)
-	}
-	twt.mutex.RUnlock()
-
-	// Process each entry
-	for _, key := range keys {
-		twt.mutex.RLock()
-		entry, exists := twt.entries[key]
-		twt.mutex.RUnlock()
-
-		if !exists {
-			continue
-		}
-
-		entry.mutex.RLock()
-		if now.Sub(entry.LastSeen) <= twt.timeWindow {
-			result[key] = twt.copyEntryUnlocked(entry)
-		}
-		entry.mutex.RUnlock()
-	}
-
-	return result
-}
-
-// Remove removes an entry
-func (twt *TimeWindowTracker[T]) Remove(key string) {
-	twt.mutex.Lock()
-	delete(twt.entries, key)
-	twt.mutex.Unlock()
-}
-
-// cleanupLoop runs the cleanup process
-func (twt *TimeWindowTracker[T]) cleanupLoop() {
 	for {
 		select {
-		case <-twt.cleanupTicker.C:
-			twt.cleanup()
-		case <-twt.stopChan:
+		case event := <-awt.eventQueue:
+			atomic.AddInt64(&awt.queueSize, -1)
+
+			// Round-robin distribution
+			worker := awt.workerPool[workerIndex]
+			workerIndex = (workerIndex + 1) % awt.numWorkers
+
+			select {
+			case worker.queue <- event:
+				// Event sent to worker
+			default:
+				// Worker queue full, try next worker
+				nextWorker := awt.workerPool[(workerIndex)%awt.numWorkers]
+				select {
+				case nextWorker.queue <- event:
+					// Event sent to next worker
+				default:
+					// All workers busy, drop event
+					atomic.AddInt64(&awt.dropped, 1)
+					awt.logger.Warn("All workers busy, dropping event", "key", event.Key)
+				}
+			}
+
+		case <-awt.stopChan:
 			return
 		}
 	}
 }
 
-// cleanup removes expired entries
-func (twt *TimeWindowTracker[T]) cleanup() {
-	twt.cleanupMutex.Lock()
-	defer twt.cleanupMutex.Unlock()
+// Worker methods
+func (w *Worker[T]) run() {
+	for {
+		select {
+		case event := <-w.queue:
+			w.processEvent(event)
+			atomic.AddInt64(&w.tracker.processed, 1)
 
-	now := time.Now()
-	cutoff := now.Add(-twt.timeWindow)
-
-	// First pass: identify expired keys
-	var expiredKeys []string
-
-	twt.mutex.RLock()
-	for key, entry := range twt.entries {
-		entry.mutex.RLock()
-		if entry.LastSeen.Before(cutoff) {
-			expiredKeys = append(expiredKeys, key)
+		case <-w.stop:
+			return
 		}
-		entry.mutex.RUnlock()
-	}
-	twt.mutex.RUnlock()
-
-	// Second pass: remove expired entries
-	if len(expiredKeys) > 0 {
-		twt.mutex.Lock()
-		for _, key := range expiredKeys {
-			// Double-check before deletion
-			if entry, exists := twt.entries[key]; exists {
-				entry.mutex.RLock()
-				stillExpired := entry.LastSeen.Before(cutoff)
-				entry.mutex.RUnlock()
-
-				if stillExpired {
-					delete(twt.entries, key)
-				}
-			}
-		}
-		remaining := len(twt.entries)
-		twt.mutex.Unlock()
-
-		twt.logger.Debug("Cleaned up expired entries",
-			"removed", len(expiredKeys),
-			"remaining", remaining)
 	}
 }
 
-// GetStats returns statistics about the tracker
-func (twt *TimeWindowTracker[T]) GetStats() map[string]interface{} {
-	twt.mutex.RLock()
-	entryCount := len(twt.entries)
+func (w *Worker[T]) processEvent(event *TrackingEvent[T]) {
+	now := event.Timestamp
 
-	totalHits := 0
-	for _, entry := range twt.entries {
-		entry.mutex.RLock()
-		totalHits += entry.HitCount
-		entry.mutex.RUnlock()
+	// Get or create entry
+	var entry *TimeWindowEntry[T]
+	if value, exists := w.tracker.entries.Load(event.Key); exists {
+		entry = value.(*TimeWindowEntry[T])
+	} else {
+		entry = &TimeWindowEntry[T]{
+			Key:       event.Key,
+			Data:      event.Data,
+			FirstSeen: now,
+		}
+
+		// Try to store, if another goroutine stored it first, use that one
+		if actual, loaded := w.tracker.entries.LoadOrStore(event.Key, entry); loaded {
+			entry = actual.(*TimeWindowEntry[T])
+		}
 	}
-	twt.mutex.RUnlock()
+
+	// Update entry atomically
+	entry.Data = event.Data
+	entry.LastSeen = now
+	hitCount := atomic.AddInt64(&entry.HitCount, 1)
+
+	// Update metadata
+	if event.Metadata != nil {
+		for k, v := range event.Metadata {
+			entry.Metadata.Store(k, v)
+		}
+	}
+
+	// Check threshold
+	if int(hitCount) >= w.tracker.maxHits {
+		w.tracker.logger.Debug("Threshold reached",
+			"key", event.Key,
+			"hits", hitCount,
+			"max_hits", w.tracker.maxHits,
+			"worker", w.id)
+
+		// Reset count and trigger callback
+		atomic.StoreInt64(&entry.HitCount, 0)
+
+		if w.tracker.onThreshold != nil {
+			// Create safe copy for callback
+			entryCopy := w.copyEntry(entry)
+			// Run callback in separate goroutine to avoid blocking worker
+			go w.tracker.onThreshold(event.Key, entryCopy)
+		}
+	}
+}
+
+func (w *Worker[T]) copyEntry(entry *TimeWindowEntry[T]) *TimeWindowEntry[T] {
+	metadataCopy := make(map[string]interface{})
+	entry.Metadata.Range(func(key, value interface{}) bool {
+		metadataCopy[key.(string)] = value
+		return true
+	})
+
+	return &TimeWindowEntry[T]{
+		Key:       entry.Key,
+		Data:      entry.Data,
+		HitCount:  atomic.LoadInt64(&entry.HitCount),
+		FirstSeen: entry.FirstSeen,
+		LastSeen:  entry.LastSeen,
+		Metadata:  sync.Map{},
+	}
+}
+
+// Get retrieves an entry (lock-free)
+func (awt *AsyncTimeWindowTracker[T]) Get(key string) (*TimeWindowEntry[T], bool) {
+	value, exists := awt.entries.Load(key)
+	if !exists {
+		return nil, false
+	}
+
+	entry := value.(*TimeWindowEntry[T])
+
+	// Check if still valid
+	if time.Since(entry.LastSeen) > awt.timeWindow {
+		return nil, false
+	}
+
+	// Create safe copy
+	metadataCopy := make(map[string]interface{})
+	entry.Metadata.Range(func(key, value interface{}) bool {
+		metadataCopy[key.(string)] = value
+		return true
+	})
+
+	return &TimeWindowEntry[T]{
+		Key:       entry.Key,
+		Data:      entry.Data,
+		HitCount:  atomic.LoadInt64(&entry.HitCount),
+		FirstSeen: entry.FirstSeen,
+		LastSeen:  entry.LastSeen,
+		Metadata:  sync.Map{},
+	}, true
+}
+
+// cleanupLoop removes expired entries
+func (awt *AsyncTimeWindowTracker[T]) cleanupLoop() {
+	for {
+		select {
+		case <-awt.cleanupTicker.C:
+			awt.cleanup()
+		case <-awt.stopChan:
+			return
+		}
+	}
+}
+
+func (awt *AsyncTimeWindowTracker[T]) cleanup() {
+	now := time.Now()
+	cutoff := now.Add(-awt.timeWindow)
+	removed := 0
+
+	awt.entries.Range(func(key, value interface{}) bool {
+		entry := value.(*TimeWindowEntry[T])
+		if entry.LastSeen.Before(cutoff) {
+			awt.entries.Delete(key)
+			removed++
+		}
+		return true
+	})
+
+	if removed > 0 {
+		awt.logger.Debug("Cleaned up expired entries", "removed", removed)
+	}
+}
+
+// GetStats returns performance statistics
+func (awt *AsyncTimeWindowTracker[T]) GetStats() map[string]interface{} {
+	entryCount := 0
+	awt.entries.Range(func(key, value interface{}) bool {
+		entryCount++
+		return true
+	})
 
 	return map[string]interface{}{
 		"active_entries": entryCount,
-		"total_hits":     totalHits,
-		"time_window":    twt.timeWindow.Seconds(),
-		"max_hits":       twt.maxHits,
+		"queue_size":     atomic.LoadInt64(&awt.queueSize),
+		"processed":      atomic.LoadInt64(&awt.processed),
+		"dropped":        atomic.LoadInt64(&awt.dropped),
+		"workers":        awt.numWorkers,
+		"time_window":    awt.timeWindow.Seconds(),
+		"max_hits":       awt.maxHits,
 	}
-}
-
-// Clear removes all entries (useful for testing)
-func (twt *TimeWindowTracker[T]) Clear() {
-	twt.mutex.Lock()
-	twt.entries = make(map[string]*TimeWindowEntry[T])
-	twt.mutex.Unlock()
-
-	twt.logger.Debug("Cleared all entries")
 }

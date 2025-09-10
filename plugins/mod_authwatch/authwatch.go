@@ -25,6 +25,8 @@ type AuthWatchConfig struct {
 	CleanupInterval int      `toml:"cleanup_interval"` // Cleanup interval in seconds (default: 600)
 	TrackSuccessful bool     `toml:"track_successful"` // Track successful logins (default: false)
 	TrackFailed     bool     `toml:"track_failed"`     // Track failed logins (default: true)
+	QueueSize       int      `toml:"queue_size"`       // Event queue size (default: 5000)
+	NumWorkers      int      `toml:"num_workers"`      // Number of workers (default: 2)
 }
 
 // AuthWatchModule represents an instance of the authwatch module
@@ -34,7 +36,7 @@ type AuthWatchModule struct {
 	api      api.CoreAPI
 	logger   api.Logger
 	services map[string]*ServiceDefinition
-	tracker  *api.TimeWindowTracker[*AuthData]
+	tracker  *api.AsyncTimeWindowTracker[*AuthData]
 }
 
 // AuthData represents authentication data for tracking
@@ -83,8 +85,8 @@ func (p *AuthWatchPlugin) Meta() api.PluginMeta {
 		DisplayName: "Authentication Watcher",
 		Author:      "Spear Team",
 		Repository:  "https://github.com/sammwyy/spear",
-		Description: "Monitors authentication logs for successful and failed login attempts with time window tracking",
-		Version:     "1.0.0",
+		Description: "Monitors authentication logs for successful and failed login attempts with async time window tracking",
+		Version:     "2.0.0",
 	}
 }
 
@@ -104,34 +106,45 @@ func (p *AuthWatchPlugin) Shutdown() error {
 
 // ValidateConfig validates the plugin configuration
 func (p *AuthWatchPlugin) ValidateConfig(config interface{}) error {
-	authConfig, ok := config.(AuthWatchConfig)
+	configMap, ok := config.(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("invalid config type for authwatch")
 	}
 
-	if authConfig.ID == "" {
+	// Validate required fields
+	if _, exists := configMap["id"]; !exists {
 		return fmt.Errorf("authwatch config must have an ID")
 	}
 
-	if len(authConfig.Services) == 0 {
+	if services, exists := configMap["services"]; !exists || len(services.([]interface{})) == 0 {
 		return fmt.Errorf("authwatch config must specify at least one service")
 	}
 
 	// Validate time window
-	if authConfig.TimeWindow < 0 {
-		return fmt.Errorf("time_window must be positive")
+	if timeWindow, exists := configMap["time_window"]; exists {
+		if tw, ok := timeWindow.(int64); ok && tw < 0 {
+			return fmt.Errorf("time_window must be positive")
+		}
 	}
 
 	// Validate max hits
-	if authConfig.MaxHits <= 0 {
-		return fmt.Errorf("max_hits must be positive")
+	if maxHits, exists := configMap["max_hits"]; exists {
+		if mh, ok := maxHits.(int64); ok && mh <= 0 {
+			return fmt.Errorf("max_hits must be positive")
+		}
 	}
 
-	// Validate that all services are supported
-	supportedServices := p.getSupportedServices()
-	for _, service := range authConfig.Services {
-		if _, exists := supportedServices[service]; !exists {
-			return fmt.Errorf("unsupported service: %s", service)
+	// Validate queue size
+	if queueSize, exists := configMap["queue_size"]; exists {
+		if qs, ok := queueSize.(int64); ok && qs <= 0 {
+			return fmt.Errorf("queue_size must be positive")
+		}
+	}
+
+	// Validate number of workers
+	if numWorkers, exists := configMap["num_workers"]; exists {
+		if nw, ok := numWorkers.(int64); ok && nw <= 0 {
+			return fmt.Errorf("num_workers must be positive")
 		}
 	}
 
@@ -148,7 +161,7 @@ func (p *AuthWatchPlugin) RegisterModules() []api.ModuleDefinition {
 	return []api.ModuleDefinition{
 		{
 			Name:        "authwatch",
-			Description: "Authentication monitoring module with time window tracking",
+			Description: "Authentication monitoring module with async time window tracking",
 			ConfigType:  nil,
 			Factory:     p.createAuthWatchModule,
 		},
@@ -168,19 +181,22 @@ func (p *AuthWatchPlugin) createAuthWatchModule(config interface{}) (api.ModuleI
 	}
 
 	// Parse config with defaults
-	var cfg AuthWatchConfig
-	cfg.TimeWindow = 300      // 5 minutes default
-	cfg.MaxHits = 5           // 5 hits default
-	cfg.CleanupInterval = 600 // 10 minutes default
-	cfg.TrackSuccessful = false
-	cfg.TrackFailed = true
+	cfg := AuthWatchConfig{
+		TimeWindow:      300, // 5 minutes default
+		MaxHits:         5,   // 5 hits default
+		CleanupInterval: 600, // 10 minutes default
+		TrackSuccessful: false,
+		TrackFailed:     true,
+		QueueSize:       5000, // 5k events buffer
+		NumWorkers:      2,    // 2 workers for auth events
+	}
 
 	if err := p.parseConfig(authConfig, &cfg); err != nil {
 		return nil, err
 	}
 
 	// Validate config
-	if err := p.ValidateConfig(cfg); err != nil {
+	if err := p.ValidateConfig(authConfig); err != nil {
 		return nil, err
 	}
 
@@ -200,14 +216,16 @@ func (p *AuthWatchPlugin) createAuthWatchModule(config interface{}) (api.ModuleI
 		}
 	}
 
-	// Initialize time window tracker
-	trackerConfig := api.TimeWindowConfig{
+	// Initialize async time window tracker
+	trackerConfig := api.AsyncTimeWindowConfig{
 		TimeWindow:      time.Duration(cfg.TimeWindow) * time.Second,
 		MaxHits:         cfg.MaxHits,
 		CleanupInterval: time.Duration(cfg.CleanupInterval) * time.Second,
+		QueueSize:       cfg.QueueSize,
+		NumWorkers:      cfg.NumWorkers,
 	}
 
-	module.tracker = api.NewTimeWindowTracker[*AuthData](
+	module.tracker = api.NewAsyncTimeWindowTracker[*AuthData](
 		trackerConfig,
 		module.onThresholdReached,
 		module.logger,
@@ -224,6 +242,7 @@ func (p *AuthWatchPlugin) parseConfig(configMap map[string]interface{}, cfg *Aut
 
 	if services, exists := configMap["services"]; exists {
 		if serviceSlice, ok := services.([]interface{}); ok {
+			cfg.Services = []string{}
 			for _, svc := range serviceSlice {
 				cfg.Services = append(cfg.Services, fmt.Sprintf("%v", svc))
 			}
@@ -232,6 +251,7 @@ func (p *AuthWatchPlugin) parseConfig(configMap map[string]interface{}, cfg *Aut
 
 	if triggers, exists := configMap["triggers"]; exists {
 		if triggerSlice, ok := triggers.([]interface{}); ok {
+			cfg.Triggers = []string{}
 			for _, trigger := range triggerSlice {
 				cfg.Triggers = append(cfg.Triggers, fmt.Sprintf("%v", trigger))
 			}
@@ -268,73 +288,19 @@ func (p *AuthWatchPlugin) parseConfig(configMap map[string]interface{}, cfg *Aut
 		}
 	}
 
+	if queueSize, exists := configMap["queue_size"]; exists {
+		if qs, ok := queueSize.(int64); ok {
+			cfg.QueueSize = int(qs)
+		}
+	}
+
+	if numWorkers, exists := configMap["num_workers"]; exists {
+		if nw, ok := numWorkers.(int64); ok {
+			cfg.NumWorkers = int(nw)
+		}
+	}
+
 	return nil
-}
-
-// getSupportedServices returns all supported authentication services
-func (p *AuthWatchPlugin) getSupportedServices() map[string]*ServiceDefinition {
-	services := make(map[string]*ServiceDefinition)
-
-	// SSH Service
-	services["ssh"] = &ServiceDefinition{
-		ID:   "ssh",
-		Name: "SSH",
-		LogFiles: []string{
-			"/var/log/auth.log",
-			"/var/log/secure",
-			"/var/log/messages",
-		},
-		SuccessRegex:   regexp.MustCompile(`Accepted\s+(?:password|publickey|keyboard-interactive)\s+for\s+(\w+)\s+from\s+([\d.]+)`),
-		SuccessIPRegex: regexp.MustCompile(`from\s+([\d.]+)`),
-		FailureRegex:   regexp.MustCompile(`Failed\s+password\s+for\s+(?:invalid\s+user\s+)?(\w+)\s+from\s+([\d.]+)`),
-		FailureIPRegex: regexp.MustCompile(`from\s+([\d.]+)`),
-		UserRegex:      regexp.MustCompile(`(?:for|user)\s+(\w+)`),
-	}
-
-	// sudo Service
-	services["sudo"] = &ServiceDefinition{
-		ID:   "sudo",
-		Name: "Sudo",
-		LogFiles: []string{
-			"/var/log/auth.log",
-			"/var/log/secure",
-			"/var/log/messages",
-		},
-		SuccessRegex: regexp.MustCompile(`(\w+)\s*:\s*TTY=.*\s*;\s*PWD=.*\s*;\s*USER=.*\s*;\s*COMMAND=`),
-		FailureRegex: regexp.MustCompile(`(\w+)\s*:\s*(?:command not allowed|authentication failure|incorrect password)`),
-		UserRegex:    regexp.MustCompile(`^(\w+)\s*:`),
-	}
-
-	// FTP Service
-	services["ftp"] = &ServiceDefinition{
-		ID:   "ftp",
-		Name: "FTP",
-		LogFiles: []string{
-			"/var/log/vsftpd.log",
-			"/var/log/ftp.log",
-			"/var/log/messages",
-		},
-		SuccessRegex:   regexp.MustCompile(`OK LOGIN:\s*Client\s*"([\d.]+)",\s*anon\s*password\s*"([^"]*)".*user\s*"([^"]*)"?`),
-		FailureRegex:   regexp.MustCompile(`FAIL LOGIN:\s*Client\s*"([\d.]+)".*user\s*"([^"]*)"?`),
-		SuccessIPRegex: regexp.MustCompile(`Client\s*"([\d.]+)"`),
-		FailureIPRegex: regexp.MustCompile(`Client\s*"([\d.]+)"`),
-		UserRegex:      regexp.MustCompile(`user\s*"([^"]*)"`),
-	}
-
-	// Apache/Web Authentication
-	services["web"] = &ServiceDefinition{
-		ID:   "web",
-		Name: "Web Authentication",
-		LogFiles: []string{
-			"/var/log/apache2/access.log",
-			"/var/log/httpd/access_log",
-			"/var/log/nginx/access.log",
-		},
-		FailureRegex:   regexp.MustCompile(`([\d.]+).*"(?:GET|POST).*(?:401|403|404)`),
-		FailureIPRegex: regexp.MustCompile(`^([\d.]+)`),
-	}
-
-	return services
 }
 
 // AuthWatchModule methods
@@ -347,9 +313,11 @@ func (m *AuthWatchModule) Start() error {
 	m.logger.Info("Starting AuthWatch module",
 		"services", m.config.Services,
 		"time_window", m.config.TimeWindow,
-		"max_hits", m.config.MaxHits)
+		"max_hits", m.config.MaxHits,
+		"queue_size", m.config.QueueSize,
+		"workers", m.config.NumWorkers)
 
-	// Start time window tracker
+	// Start async time window tracker
 	m.tracker.Start()
 
 	// Register file watchers for each service
@@ -357,11 +325,13 @@ func (m *AuthWatchModule) Start() error {
 		regexPattern := m.buildCombinedRegex(serviceDef)
 
 		if err := m.api.WatchFileWithFallback(serviceDef.LogFiles, m, regexPattern); err != nil {
-			m.logger.Error("Failed to register file watcher for service", "service", serviceName, "error", err)
+			m.logger.Error("Failed to register file watcher for service",
+				"service", serviceName, "error", err)
 			continue
 		}
 
-		m.logger.Info("Registered file watcher for service", "service", serviceName, "files", serviceDef.LogFiles)
+		m.logger.Info("Registered file watcher for service",
+			"service", serviceName, "files", serviceDef.LogFiles)
 	}
 
 	return nil
@@ -407,59 +377,50 @@ func (m *AuthWatchModule) HandleEvent(event api.Event) error {
 		"user", authEvent.User,
 		"ip", authEvent.IP)
 
-	// Track the authentication event
+	// Track the authentication event asynchronously
 	return m.trackAuthEvent(authEvent)
 }
 
-// trackAuthEvent tracks an authentication event using the time window tracker
+// trackAuthEvent tracks an authentication event using the async time window tracker
 func (m *AuthWatchModule) trackAuthEvent(authEvent *AuthEvent) error {
-	// Create tracking key (IP-based tracking)
-	trackingKey := authEvent.IP
-
-	// Get existing data or create new
-	var authData *AuthData
-	if entry, exists := m.tracker.Get(trackingKey); exists {
-		authData = &AuthData{
-			IP:            entry.Data.IP,
-			User:          entry.Data.User,
-			Service:       entry.Data.Service,
-			SuccessCount:  entry.Data.SuccessCount,
-			FailureCount:  entry.Data.FailureCount,
-			LastEventType: entry.Data.LastEventType,
-			LastRawLine:   entry.Data.LastRawLine,
-		}
-	} else {
-		authData = &AuthData{
-			IP:      authEvent.IP,
-			Service: authEvent.Service,
-		}
+	// Skip if no IP address found
+	if authEvent.IP == "" {
+		return nil
 	}
 
-	// Update auth data
-	authData.User = authEvent.User
-	authData.Service = authEvent.Service
-	authData.LastEventType = authEvent.Type
-	authData.LastRawLine = authEvent.RawLine
+	// Create simplified auth data for the event
+	authData := &AuthData{
+		IP:            authEvent.IP,
+		User:          authEvent.User,
+		Service:       authEvent.Service,
+		LastEventType: authEvent.Type,
+		LastRawLine:   authEvent.RawLine,
+	}
 
+	// Initialize counts based on event type
 	if authEvent.Type == "success" {
-		authData.SuccessCount++
+		authData.SuccessCount = 1
+		authData.FailureCount = 0
 	} else {
-		authData.FailureCount++
+		authData.SuccessCount = 0
+		authData.FailureCount = 1
 	}
 
 	// Create metadata for the tracker
 	metadata := map[string]interface{}{
-		"user":          authEvent.User,
-		"service":       authEvent.Service,
-		"event_type":    authEvent.Type,
-		"timestamp":     authEvent.Timestamp,
-		"raw_line":      authEvent.RawLine,
-		"success_count": authData.SuccessCount,
-		"failure_count": authData.FailureCount,
+		"user":       authEvent.User,
+		"service":    authEvent.Service,
+		"event_type": authEvent.Type,
+		"timestamp":  authEvent.Timestamp,
+		"raw_line":   authEvent.RawLine,
 	}
 
-	// Track the event
-	m.tracker.Track(trackingKey, authData, metadata)
+	// Track asynchronously - this will never block the file watcher
+	queued := m.tracker.Track(authEvent.IP, authData, metadata)
+	if !queued {
+		m.logger.Debug("Auth tracking event dropped due to full queue",
+			"ip", authEvent.IP, "service", authEvent.Service)
+	}
 
 	return nil
 }
@@ -468,6 +429,9 @@ func (m *AuthWatchModule) trackAuthEvent(authEvent *AuthEvent) error {
 func (m *AuthWatchModule) onThresholdReached(key string, entry *api.TimeWindowEntry[*AuthData]) {
 	authData := entry.Data
 
+	// Calculate severity based on the pattern
+	severity := m.calculateSeverity(authData, int(entry.HitCount))
+
 	m.logger.Warn("Authentication threshold reached",
 		"ip", authData.IP,
 		"user", authData.User,
@@ -475,8 +439,8 @@ func (m *AuthWatchModule) onThresholdReached(key string, entry *api.TimeWindowEn
 		"hits", entry.HitCount,
 		"max_hits", m.config.MaxHits,
 		"time_window", m.config.TimeWindow,
-		"success_count", authData.SuccessCount,
-		"failure_count", authData.FailureCount)
+		"last_event_type", authData.LastEventType,
+		"severity", severity)
 
 	// Prepare trigger arguments
 	args := map[string]interface{}{
@@ -487,37 +451,40 @@ func (m *AuthWatchModule) onThresholdReached(key string, entry *api.TimeWindowEn
 		"hits":            entry.HitCount,
 		"max_hits":        m.config.MaxHits,
 		"time_window":     m.config.TimeWindow,
-		"success_count":   authData.SuccessCount,
-		"failure_count":   authData.FailureCount,
 		"first_seen":      entry.FirstSeen,
 		"last_seen":       entry.LastSeen,
 		"last_event_type": authData.LastEventType,
 		"raw_line":        authData.LastRawLine,
-		"metadata":        entry.Metadata,
-		"severity":        m.calculateSeverity(authData),
+		"severity":        severity,
 	}
 
 	// Execute configured triggers
 	for _, triggerID := range m.config.Triggers {
 		if err := m.api.ExecuteTrigger(triggerID, args); err != nil {
-			m.logger.Error("Failed to execute trigger", "trigger", triggerID, "error", err)
+			m.logger.Error("Failed to execute trigger",
+				"trigger", triggerID, "error", err)
 		}
 	}
 }
 
-// calculateSeverity calculates severity based on authentication data
-func (m *AuthWatchModule) calculateSeverity(authData *AuthData) string {
-	// High severity for many failures with few successes
-	if authData.FailureCount > 10 && authData.SuccessCount == 0 {
+// calculateSeverity calculates severity based on authentication data and hit count
+func (m *AuthWatchModule) calculateSeverity(authData *AuthData, hitCount int) string {
+	// High severity for rapid auth attempts
+	if hitCount >= m.config.MaxHits*2 {
+		return "critical"
+	}
+
+	// High severity for many failures
+	if authData.LastEventType == "failure" && hitCount > 10 {
 		return "high"
 	}
 
-	// Medium severity for mixed success/failure
-	if authData.FailureCount > 5 {
+	// Medium severity for repeated attempts
+	if hitCount > 5 {
 		return "medium"
 	}
 
-	// Low severity for mostly successes
+	// Low severity for few attempts
 	return "low"
 }
 
@@ -544,7 +511,8 @@ func (m *AuthWatchModule) buildCombinedRegex(serviceDef *ServiceDefinition) stri
 func (m *AuthWatchModule) parseAuthEvent(line string) *AuthEvent {
 	for serviceName, serviceDef := range m.services {
 		// Check for success
-		if serviceDef.SuccessRegex != nil && serviceDef.SuccessRegex.MatchString(line) {
+		if serviceDef.SuccessRegex != nil && m.config.TrackSuccessful &&
+			serviceDef.SuccessRegex.MatchString(line) {
 			return &AuthEvent{
 				Type:      "success",
 				Service:   serviceName,
@@ -556,7 +524,8 @@ func (m *AuthWatchModule) parseAuthEvent(line string) *AuthEvent {
 		}
 
 		// Check for failure
-		if serviceDef.FailureRegex != nil && serviceDef.FailureRegex.MatchString(line) {
+		if serviceDef.FailureRegex != nil && m.config.TrackFailed &&
+			serviceDef.FailureRegex.MatchString(line) {
 			return &AuthEvent{
 				Type:      "failure",
 				Service:   serviceName,
@@ -574,7 +543,7 @@ func (m *AuthWatchModule) parseAuthEvent(line string) *AuthEvent {
 // extractUser extracts username from log line
 func (m *AuthWatchModule) extractUser(line string, serviceDef *ServiceDefinition) string {
 	if serviceDef.UserRegex == nil {
-		return ""
+		return "unknown"
 	}
 
 	matches := serviceDef.UserRegex.FindStringSubmatch(line)
@@ -582,7 +551,7 @@ func (m *AuthWatchModule) extractUser(line string, serviceDef *ServiceDefinition
 		return matches[1]
 	}
 
-	return ""
+	return "unknown"
 }
 
 // extractIP extracts IP address from log line
@@ -596,6 +565,12 @@ func (m *AuthWatchModule) extractIP(line string, serviceDef *ServiceDefinition, 
 	}
 
 	if ipRegex == nil {
+		// Fallback to general IP extraction
+		generalIPRegex := regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+		matches := generalIPRegex.FindStringSubmatch(line)
+		if len(matches) > 1 {
+			return matches[1]
+		}
 		return ""
 	}
 
@@ -605,4 +580,70 @@ func (m *AuthWatchModule) extractIP(line string, serviceDef *ServiceDefinition, 
 	}
 
 	return ""
+}
+
+// getSupportedServices returns all supported authentication services
+func (p *AuthWatchPlugin) getSupportedServices() map[string]*ServiceDefinition {
+	services := make(map[string]*ServiceDefinition)
+
+	// SSH Service
+	services["ssh"] = &ServiceDefinition{
+		ID:   "ssh",
+		Name: "SSH",
+		LogFiles: []string{
+			"/var/log/auth.log",
+			"/var/log/secure",
+			"/var/log/messages",
+		},
+		SuccessRegex:   regexp.MustCompile(`Accepted\s+(?:password|publickey|keyboard-interactive)\s+for\s+(\w+)\s+from\s+([\d.]+)`),
+		SuccessIPRegex: regexp.MustCompile(`from\s+([\d.]+)`),
+		FailureRegex:   regexp.MustCompile(`Failed\s+password\s+for\s+(?:invalid\s+user\s+)?(\w+)\s+from\s+([\d.]+)`),
+		FailureIPRegex: regexp.MustCompile(`from\s+([\d.]+)`),
+		UserRegex:      regexp.MustCompile(`(?:for|user)\s+(\w+)`),
+	}
+
+	// sudo service
+	services["sudo"] = &ServiceDefinition{
+		ID:   "sudo",
+		Name: "Sudo",
+		LogFiles: []string{
+			"/var/log/auth.log",
+			"/var/log/secure",
+			"/var/log/messages",
+		},
+		SuccessRegex: regexp.MustCompile(`(\w+)\s*:\s*TTY=.*\s*;\s*PWD=.*\s*;\s*USER=.*\s*;\s*COMMAND=`),
+		FailureRegex: regexp.MustCompile(`(\w+)\s*:\s*(?:command not allowed|authentication failure|incorrect password)`),
+		UserRegex:    regexp.MustCompile(`^(\w+)\s*:`),
+	}
+
+	// FTP Service
+	services["ftp"] = &ServiceDefinition{
+		ID:   "ftp",
+		Name: "FTP",
+		LogFiles: []string{
+			"/var/log/vsftpd.log",
+			"/var/log/ftp.log",
+			"/var/log/messages",
+		},
+		SuccessRegex:   regexp.MustCompile(`OK LOGIN:\s*Client\s*"([\d.]+)",.*user\s*"([^"]*)"?`),
+		FailureRegex:   regexp.MustCompile(`FAIL LOGIN:\s*Client\s*"([\d.]+)".*user\s*"([^"]*)"?`),
+		SuccessIPRegex: regexp.MustCompile(`Client\s*"([\d.]+)"`),
+		FailureIPRegex: regexp.MustCompile(`Client\s*"([\d.]+)"`),
+		UserRegex:      regexp.MustCompile(`user\s*"([^"]*)"`),
+	}
+
+	// Apache/Web Authentication
+	services["web"] = &ServiceDefinition{
+		ID:   "web",
+		Name: "Web Authentication",
+		LogFiles: []string{
+			"/var/log/apache2/access.log",
+			"/var/log/httpd/access_log",
+			"/var/log/nginx/access.log",
+		},
+		FailureRegex:   regexp.MustCompile(`([\d.]+).*"(?:GET|POST).*(?:401|403|404)`),
+		FailureIPRegex: regexp.MustCompile(`^([\d.]+)`),
+	}
+
+	return services
 }

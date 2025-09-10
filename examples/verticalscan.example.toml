@@ -30,7 +30,7 @@ append = true
 # Vertical port scan detection configuration
 [[verticalscan]]
 id = "eth0_monitor"
-interface = "eth0"                             # Network interface to monitor
+interface = "wlp1s0"                           # Network interface to monitor
 protocols = ["tcp", "udp"]                     # Protocols to monitor
 time_window = 30                               # Time window in seconds
 max_pings = 10                                 # Maximum pings before alerting
@@ -44,7 +44,7 @@ detect_fragmented = true                       # Detect fragmented packets
 # Example for monitoring only specific ports
 [[verticalscan]]
 id = "critical_ports"
-interface = "eth0"
+interface = "wlp1s0"
 protocols = ["tcp"]
 time_window = 15                  # Shorter window for critical ports
 max_pings = 5                     # Fewer pings to alert

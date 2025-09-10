@@ -22,39 +22,53 @@ type VerticalScanPlugin struct {
 // VerticalScanConfig represents the configuration for the vertical scan module
 type VerticalScanConfig struct {
 	ID               string   `toml:"id"`
-	Interface        string   `toml:"interface"`         // Network interface to monitor
-	Protocols        []string `toml:"protocols"`         // tcp, udp
-	TimeWindow       int      `toml:"time_window"`       // Time window in seconds
-	MaxPings         int      `toml:"max_pings"`         // Maximum pings before triggering
-	PortMode         string   `toml:"port_mode"`         // "whitelist" or "blacklist"
-	Ports            []int    `toml:"ports"`             // List of ports
-	CleanupInterval  int      `toml:"cleanup_interval"`  // Cleanup interval in seconds
-	Triggers         []string `toml:"triggers"`          // Triggers to execute
-	DetectStealth    bool     `toml:"detect_stealth"`    // Detect stealth scans
-	DetectFragmented bool     `toml:"detect_fragmented"` // Detect fragmented packets
+	Interface        string   `toml:"interface"`
+	Protocols        []string `toml:"protocols"`
+	TimeWindow       int      `toml:"time_window"`
+	MaxPings         int      `toml:"max_pings"`
+	PortMode         string   `toml:"port_mode"`
+	Ports            []int    `toml:"ports"`
+	CleanupInterval  int      `toml:"cleanup_interval"`
+	Triggers         []string `toml:"triggers"`
+	DetectStealth    bool     `toml:"detect_stealth"`
+	DetectFragmented bool     `toml:"detect_fragmented"`
+	IgnoreOutbound   bool     `toml:"ignore_outbound"`
+	QueueSize        int      `toml:"queue_size"`
+	NumWorkers       int      `toml:"num_workers"`
 }
 
 // VerticalScanModule represents an instance of the vertical scan module
 type VerticalScanModule struct {
-	id        string
-	config    VerticalScanConfig
-	api       api.CoreAPI
-	logger    api.Logger
-	handle    *afpacket.TPacket
-	tracker   *api.TimeWindowTracker[*ScanData]
-	running   bool
-	stopChan  chan struct{}
-	waitGroup sync.WaitGroup
+	id             string
+	config         VerticalScanConfig
+	api            api.CoreAPI
+	logger         api.Logger
+	handle         *afpacket.TPacket
+	tracker        *api.AsyncTimeWindowTracker[*ScanData]
+	running        bool
+	stopChan       chan struct{}
+	waitGroup      sync.WaitGroup
+	localNetworks  []net.IPNet
+	connectionMap  sync.Map
+	ipCacheTTL     time.Duration
+	lastNetRefresh time.Time
 }
 
 // ScanData represents scanning activity data for the time window tracker
 type ScanData struct {
 	IP           string
-	Ports        map[int]bool
-	ScanTypes    map[string]bool // syn, fin, xmas, null, fragmented
-	TCPFlags     []uint8         // History of TCP flags seen
+	Ports        []int
+	ScanTypes    []string
 	TotalPings   int
 	LastProtocol string
+}
+
+// ConnectionKey represents a connection identifier
+type ConnectionKey struct {
+	SrcIP   string
+	DstIP   string
+	DstPort int
+	Proto   string
 }
 
 // ScanType represents different types of scans
@@ -81,8 +95,8 @@ func (p *VerticalScanPlugin) Meta() api.PluginMeta {
 		DisplayName: "Vertical Port Scan Detector",
 		Author:      "Spear Team",
 		Repository:  "https://github.com/sammwyy/spear",
-		Description: "Detects vertical port scans and stealth scans using AF_PACKET with time window tracking",
-		Version:     "2.0.0",
+		Description: "Detects vertical port scans and stealth scans using AF_PACKET with async time window tracking",
+		Version:     "3.0.0",
 	}
 }
 
@@ -107,7 +121,6 @@ func (p *VerticalScanPlugin) ValidateConfig(config interface{}) error {
 		return fmt.Errorf("invalid config type for verticalscan")
 	}
 
-	// Validate required fields
 	if _, exists := configMap["id"]; !exists {
 		return fmt.Errorf("verticalscan config must have an ID")
 	}
@@ -116,13 +129,11 @@ func (p *VerticalScanPlugin) ValidateConfig(config interface{}) error {
 		return fmt.Errorf("verticalscan config must specify interface")
 	}
 
-	// Validate interface exists
 	iface := fmt.Sprintf("%v", configMap["interface"])
 	if _, err := net.InterfaceByName(iface); err != nil {
 		return fmt.Errorf("network interface %s not found: %w", iface, err)
 	}
 
-	// Validate port mode
 	if mode, exists := configMap["port_mode"]; exists {
 		modeStr := fmt.Sprintf("%v", mode)
 		if modeStr != "whitelist" && modeStr != "blacklist" {
@@ -130,14 +141,12 @@ func (p *VerticalScanPlugin) ValidateConfig(config interface{}) error {
 		}
 	}
 
-	// Validate time window
 	if timeWindow, exists := configMap["time_window"]; exists {
 		if tw, ok := timeWindow.(int64); ok && tw < 0 {
 			return fmt.Errorf("time_window must be positive")
 		}
 	}
 
-	// Validate max pings
 	if maxPings, exists := configMap["max_pings"]; exists {
 		if mp, ok := maxPings.(int64); ok && mp <= 0 {
 			return fmt.Errorf("max_pings must be positive")
@@ -157,7 +166,7 @@ func (p *VerticalScanPlugin) RegisterModules() []api.ModuleDefinition {
 	return []api.ModuleDefinition{
 		{
 			Name:        "verticalscan",
-			Description: "Vertical port scan detection module with time window tracking",
+			Description: "Vertical port scan detection module with async time window tracking",
 			ConfigType:  reflect.TypeOf(VerticalScanConfig{}),
 			Factory:     p.createVerticalScanModule,
 		},
@@ -166,7 +175,7 @@ func (p *VerticalScanPlugin) RegisterModules() []api.ModuleDefinition {
 
 // RegisterTriggers returns the triggers provided by this plugin
 func (p *VerticalScanPlugin) RegisterTriggers() []api.TriggerDefinition {
-	return []api.TriggerDefinition{} // This plugin doesn't provide triggers
+	return []api.TriggerDefinition{}
 }
 
 // createVerticalScanModule creates a new vertical scan module instance
@@ -176,44 +185,46 @@ func (p *VerticalScanPlugin) createVerticalScanModule(config interface{}) (api.M
 		return nil, fmt.Errorf("invalid config format")
 	}
 
-	// Parse configuration with defaults
 	cfg := VerticalScanConfig{
-		TimeWindow:       30,          // Default 30 seconds
-		MaxPings:         10,          // Default 10 pings
-		PortMode:         "blacklist", // Default blacklist (all ports)
-		Ports:            []int{},     // Empty list
-		CleanupInterval:  60,          // Default 60 seconds cleanup
+		TimeWindow:       30,
+		MaxPings:         10,
+		PortMode:         "blacklist",
+		Ports:            []int{},
+		CleanupInterval:  60,
 		DetectStealth:    true,
 		DetectFragmented: true,
+		IgnoreOutbound:   true,
 		Protocols:        []string{"tcp", "udp"},
+		QueueSize:        5000,
+		NumWorkers:       2,
 	}
 
-	// Parse all configuration fields
 	if err := p.parseConfig(configMap, &cfg); err != nil {
 		return nil, err
 	}
 
-	// Validate config
 	if err := p.ValidateConfig(configMap); err != nil {
 		return nil, err
 	}
 
 	module := &VerticalScanModule{
-		id:       cfg.ID,
-		config:   cfg,
-		api:      p.api,
-		logger:   p.api.GetLogger(fmt.Sprintf("verticalscan.%s", cfg.ID)),
-		stopChan: make(chan struct{}),
+		id:         cfg.ID,
+		config:     cfg,
+		api:        p.api,
+		logger:     p.api.GetLogger(fmt.Sprintf("verticalscan.%s", cfg.ID)),
+		stopChan:   make(chan struct{}),
+		ipCacheTTL: 5 * time.Minute,
 	}
 
-	// Initialize time window tracker
-	trackerConfig := api.TimeWindowConfig{
+	trackerConfig := api.AsyncTimeWindowConfig{
 		TimeWindow:      time.Duration(cfg.TimeWindow) * time.Second,
 		MaxHits:         cfg.MaxPings,
 		CleanupInterval: time.Duration(cfg.CleanupInterval) * time.Second,
+		QueueSize:       cfg.QueueSize,
+		NumWorkers:      cfg.NumWorkers,
 	}
 
-	module.tracker = api.NewTimeWindowTracker[*ScanData](
+	module.tracker = api.NewAsyncTimeWindowTracker(
 		trackerConfig,
 		module.onThresholdReached,
 		module.logger,
@@ -295,6 +306,24 @@ func (p *VerticalScanPlugin) parseConfig(configMap map[string]interface{}, cfg *
 		}
 	}
 
+	if ignoreOutbound, exists := configMap["ignore_outbound"]; exists {
+		if io, ok := ignoreOutbound.(bool); ok {
+			cfg.IgnoreOutbound = io
+		}
+	}
+
+	if queueSize, exists := configMap["queue_size"]; exists {
+		if qs, ok := queueSize.(int64); ok {
+			cfg.QueueSize = int(qs)
+		}
+	}
+
+	if numWorkers, exists := configMap["num_workers"]; exists {
+		if nw, ok := numWorkers.(int64); ok {
+			cfg.NumWorkers = int(nw)
+		}
+	}
+
 	return nil
 }
 
@@ -308,9 +337,13 @@ func (m *VerticalScanModule) Start() error {
 	m.logger.Info("Starting VerticalScan module",
 		"interface", m.config.Interface,
 		"time_window", m.config.TimeWindow,
-		"max_pings", m.config.MaxPings)
+		"max_pings", m.config.MaxPings,
+		"ignore_outbound", m.config.IgnoreOutbound)
 
-	// Create AF_PACKET socket
+	if err := m.refreshLocalNetworks(); err != nil {
+		return fmt.Errorf("failed to get local networks: %w", err)
+	}
+
 	handle, err := afpacket.NewTPacket(afpacket.OptInterface(m.config.Interface))
 	if err != nil {
 		return fmt.Errorf("failed to create AF_PACKET socket: %w", err)
@@ -319,12 +352,12 @@ func (m *VerticalScanModule) Start() error {
 	m.handle = handle
 	m.running = true
 
-	// Start time window tracker
 	m.tracker.Start()
 
-	// Start packet capture goroutine
 	m.waitGroup.Add(1)
 	go m.capturePackets()
+
+	go m.connectionCleanupLoop()
 
 	m.logger.Info("VerticalScan module started")
 	return nil
@@ -350,8 +383,104 @@ func (m *VerticalScanModule) Stop() error {
 }
 
 func (m *VerticalScanModule) HandleEvent(event api.Event) error {
-	// This module generates events, doesn't handle them
 	return nil
+}
+
+// refreshLocalNetworks gets local network ranges
+func (m *VerticalScanModule) refreshLocalNetworks() error {
+	if time.Since(m.lastNetRefresh) < m.ipCacheTTL {
+		return nil
+	}
+
+	iface, err := net.InterfaceByName(m.config.Interface)
+	if err != nil {
+		return err
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return err
+	}
+
+	m.localNetworks = []net.IPNet{}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok {
+			m.localNetworks = append(m.localNetworks, *ipnet)
+		}
+	}
+
+	m.lastNetRefresh = time.Now()
+	return nil
+}
+
+// isLocalIP checks if an IP is in local networks
+func (m *VerticalScanModule) isLocalIP(ip string) bool {
+	if time.Since(m.lastNetRefresh) > m.ipCacheTTL {
+		m.refreshLocalNetworks()
+	}
+
+	targetIP := net.ParseIP(ip)
+	if targetIP == nil {
+		return false
+	}
+
+	for _, network := range m.localNetworks {
+		if network.Contains(targetIP) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isOutboundConnection checks if this is an outbound connection we initiated
+func (m *VerticalScanModule) isOutboundConnection(srcIP, dstIP string, dstPort int, protocol string, tcp *layers.TCP) bool {
+	if !m.config.IgnoreOutbound {
+		return false
+	}
+
+	connKey := ConnectionKey{
+		SrcIP:   srcIP,
+		DstIP:   dstIP,
+		DstPort: dstPort,
+		Proto:   protocol,
+	}
+
+	if protocol == "tcp" && tcp != nil {
+		if tcp.SYN && !tcp.ACK {
+			if m.isLocalIP(srcIP) && !m.isLocalIP(dstIP) {
+				m.connectionMap.Store(connKey, time.Now())
+				return true
+			}
+		}
+
+		if _, exists := m.connectionMap.Load(connKey); exists {
+			return true
+		}
+	}
+
+	return false
+}
+
+// connectionCleanupLoop cleans old connection entries
+func (m *VerticalScanModule) connectionCleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cutoff := time.Now().Add(-10 * time.Minute)
+			m.connectionMap.Range(func(key, value interface{}) bool {
+				if timestamp, ok := value.(time.Time); ok && timestamp.Before(cutoff) {
+					m.connectionMap.Delete(key)
+				}
+				return true
+			})
+		case <-m.stopChan:
+			return
+		}
+	}
 }
 
 // capturePackets captures and analyzes network packets
@@ -376,13 +505,11 @@ func (m *VerticalScanModule) capturePackets() {
 
 // analyzePacket analyzes a single packet for scan patterns
 func (m *VerticalScanModule) analyzePacket(packet gopacket.Packet) {
-	// Get network layer
 	networkLayer := packet.NetworkLayer()
 	if networkLayer == nil {
 		return
 	}
 
-	// Get transport layer
 	transportLayer := packet.TransportLayer()
 	if transportLayer == nil {
 		return
@@ -392,10 +519,8 @@ func (m *VerticalScanModule) analyzePacket(packet gopacket.Packet) {
 	var dstPort int
 	var protocol string
 	var scanType ScanType
-	var tcpFlags uint8
 	var isFragmented bool
 
-	// Parse IP layer
 	if ipv4, ok := networkLayer.(*layers.IPv4); ok {
 		srcIP = ipv4.SrcIP.String()
 		dstIP = ipv4.DstIP.String()
@@ -407,18 +532,20 @@ func (m *VerticalScanModule) analyzePacket(packet gopacket.Packet) {
 		return
 	}
 
-	// Check if we should monitor this protocol
-	if tcp, ok := transportLayer.(*layers.TCP); ok {
+	var tcp *layers.TCP
+	if tcpLayer, ok := transportLayer.(*layers.TCP); ok {
 		protocol = "tcp"
+		tcp = tcpLayer
 		if !m.shouldMonitorProtocol("tcp") {
 			return
 		}
 
 		dstPort = int(tcp.DstPort)
-		tcpFlags = tcpFlagsToByte(tcp)
-
-		// Determine scan type based on TCP flags
 		scanType = m.determineTCPScanType(tcp)
+
+		if !m.isConnectionInitiation(tcp) {
+			return
+		}
 
 	} else if udp, ok := transportLayer.(*layers.UDP); ok {
 		protocol = "udp"
@@ -427,84 +554,58 @@ func (m *VerticalScanModule) analyzePacket(packet gopacket.Packet) {
 		}
 
 		dstPort = int(udp.DstPort)
-		scanType = ScanTypeConnect // UDP scans are typically connect-style
+		scanType = ScanTypeConnect
 
 	} else {
 		return
 	}
 
-	// Check if we should monitor this port
 	if !m.shouldMonitorPort(dstPort) {
 		return
 	}
 
-	// Check if this is a local destination (being scanned)
 	if !m.isLocalIP(dstIP) {
 		return
 	}
 
-	// Track the scan attempt
-	m.trackScanAttempt(srcIP, dstPort, protocol, scanType, tcpFlags, isFragmented)
+	if m.isOutboundConnection(srcIP, dstIP, dstPort, protocol, tcp) {
+		return
+	}
+
+	m.trackScanAttempt(srcIP, dstPort, protocol, scanType, isFragmented)
 }
 
-// trackScanAttempt tracks a scan attempt using the time window tracker
-func (m *VerticalScanModule) trackScanAttempt(srcIP string, dstPort int, protocol string, scanType ScanType, tcpFlags uint8, isFragmented bool) {
-	// Create tracking key (IP-based tracking)
-	trackingKey := srcIP
+// isConnectionInitiation checks if this packet represents a connection attempt
+func (m *VerticalScanModule) isConnectionInitiation(tcp *layers.TCP) bool {
+	return tcp.SYN && !tcp.ACK
+}
 
-	// Get existing data or create new
-	var scanData *ScanData
-	if entry, exists := m.tracker.Get(trackingKey); exists {
-		scanData = entry.Data
-	} else {
-		scanData = &ScanData{
-			IP:        srcIP,
-			Ports:     make(map[int]bool),
-			ScanTypes: make(map[string]bool),
-			TCPFlags:  []uint8{},
-		}
+// trackScanAttempt tracks a scan attempt using the async time window tracker
+func (m *VerticalScanModule) trackScanAttempt(srcIP string, dstPort int, protocol string, scanType ScanType, isFragmented bool) {
+	scanData := &ScanData{
+		IP:           srcIP,
+		Ports:        []int{dstPort},
+		ScanTypes:    []string{m.getScanTypeName(scanType)},
+		TotalPings:   1,
+		LastProtocol: protocol,
 	}
-
-	// Update scan data
-	scanData.LastProtocol = protocol
-	scanData.TCPFlags = append(scanData.TCPFlags, tcpFlags)
-
-	// Track port if not seen before in this window
-	if !scanData.Ports[dstPort] {
-		scanData.Ports[dstPort] = true
-		scanData.TotalPings++
-	}
-
-	// Track scan types
-	scanTypeName := m.getScanTypeName(scanType)
-	scanData.ScanTypes[scanTypeName] = true
 
 	if isFragmented && m.config.DetectFragmented {
-		scanData.ScanTypes["fragmented"] = true
+		scanData.ScanTypes = append(scanData.ScanTypes, "fragmented")
 	}
 
-	// Create metadata for the tracker
 	metadata := map[string]interface{}{
 		"port":          dstPort,
 		"protocol":      protocol,
-		"scan_type":     scanTypeName,
-		"tcp_flags":     tcpFlags,
+		"scan_type":     m.getScanTypeName(scanType),
 		"is_fragmented": isFragmented,
 		"timestamp":     time.Now(),
-		"ports_scanned": len(scanData.Ports),
-		"scan_methods":  m.getScanTypesList(scanData.ScanTypes),
-		"total_pings":   scanData.TotalPings,
 	}
 
-	m.logger.Debug("Tracking scan attempt",
-		"source_ip", srcIP,
-		"port", dstPort,
-		"protocol", protocol,
-		"scan_type", scanTypeName,
-		"ports_count", len(scanData.Ports))
-
-	// Track the event - the tracker will handle threshold checking
-	m.tracker.Track(trackingKey, scanData, metadata)
+	queued := m.tracker.Track(srcIP, scanData, metadata)
+	if !queued {
+		m.logger.Debug("Scan tracking event dropped due to full queue", "source_ip", srcIP)
+	}
 }
 
 // onThresholdReached is called when the scan threshold is reached
@@ -520,25 +621,21 @@ func (m *VerticalScanModule) onThresholdReached(key string, entry *api.TimeWindo
 		"time_window", m.config.TimeWindow,
 		"severity", m.calculateSeverity(scanData))
 
-	// Prepare trigger arguments
 	args := map[string]interface{}{
 		"scan_type":    "vertical",
 		"source_ip":    scanData.IP,
 		"protocol":     scanData.LastProtocol,
 		"port_count":   len(scanData.Ports),
-		"ports":        m.getPortList(scanData.Ports),
-		"scan_methods": m.getScanTypesList(scanData.ScanTypes),
+		"ports":        scanData.Ports,
+		"scan_methods": scanData.ScanTypes,
 		"total_hits":   entry.HitCount,
 		"max_hits":     m.config.MaxPings,
 		"first_seen":   entry.FirstSeen,
 		"last_seen":    entry.LastSeen,
 		"time_window":  m.config.TimeWindow,
 		"severity":     m.calculateSeverity(scanData),
-		"tcp_flags":    scanData.TCPFlags,
-		"metadata":     entry.Metadata,
 	}
 
-	// Execute configured triggers
 	for _, triggerID := range m.config.Triggers {
 		if err := m.api.ExecuteTrigger(triggerID, args); err != nil {
 			m.logger.Error("Failed to execute trigger", "trigger", triggerID, "error", err)
@@ -546,52 +643,24 @@ func (m *VerticalScanModule) onThresholdReached(key string, entry *api.TimeWindo
 	}
 }
 
-func tcpFlagsToByte(tcp *layers.TCP) uint8 {
-	var flags uint8
-	if tcp.FIN {
-		flags |= 1 << 0
-	}
-	if tcp.SYN {
-		flags |= 1 << 1
-	}
-	if tcp.RST {
-		flags |= 1 << 2
-	}
-	if tcp.PSH {
-		flags |= 1 << 3
-	}
-	if tcp.ACK {
-		flags |= 1 << 4
-	}
-	if tcp.URG {
-		flags |= 1 << 5
-	}
-	return flags
-}
-
 // determineTCPScanType determines the type of TCP scan based on flags
 func (m *VerticalScanModule) determineTCPScanType(tcp *layers.TCP) ScanType {
-	// SYN scan (only SYN flag set)
 	if tcp.SYN && !tcp.ACK && !tcp.FIN && !tcp.RST && !tcp.PSH && !tcp.URG {
 		return ScanTypeSYN
 	}
 
-	// FIN scan (only FIN flag set)
 	if tcp.FIN && !tcp.SYN && !tcp.ACK && !tcp.RST && !tcp.PSH && !tcp.URG {
 		return ScanTypeFIN
 	}
 
-	// Xmas scan (FIN, PSH, URG flags set)
 	if tcp.FIN && tcp.PSH && tcp.URG && !tcp.SYN && !tcp.ACK && !tcp.RST {
 		return ScanTypeXmas
 	}
 
-	// Null scan (no flags set)
 	if !tcp.FIN && !tcp.SYN && !tcp.ACK && !tcp.RST && !tcp.PSH && !tcp.URG {
 		return ScanTypeNull
 	}
 
-	// Default to connect scan
 	return ScanTypeConnect
 }
 
@@ -608,7 +677,6 @@ func (m *VerticalScanModule) shouldMonitorProtocol(protocol string) bool {
 // shouldMonitorPort checks if we should monitor this port based on whitelist/blacklist
 func (m *VerticalScanModule) shouldMonitorPort(port int) bool {
 	if len(m.config.Ports) == 0 {
-		// Empty list with blacklist means monitor all ports
 		return m.config.PortMode == "blacklist"
 	}
 
@@ -622,36 +690,9 @@ func (m *VerticalScanModule) shouldMonitorPort(port int) bool {
 
 	if m.config.PortMode == "whitelist" {
 		return inList
-	} else { // blacklist
+	} else {
 		return !inList
 	}
-}
-
-// isLocalIP checks if an IP is local to this machine
-func (m *VerticalScanModule) isLocalIP(ip string) bool {
-	// Get interface
-	iface, err := net.InterfaceByName(m.config.Interface)
-	if err != nil {
-		return false
-	}
-
-	// Get addresses
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return false
-	}
-
-	targetIP := net.ParseIP(ip)
-
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok {
-			if ipnet.IP.Equal(targetIP) {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // getScanTypeName converts scan type to string
@@ -672,34 +713,15 @@ func (m *VerticalScanModule) getScanTypeName(scanType ScanType) string {
 	}
 }
 
-// getPortList converts port map to list
-func (m *VerticalScanModule) getPortList(ports map[int]bool) []int {
-	portList := make([]int, 0, len(ports))
-	for port := range ports {
-		portList = append(portList, port)
-	}
-	return portList
-}
-
-// getScanTypesList converts scan types map to list
-func (m *VerticalScanModule) getScanTypesList(scanTypes map[string]bool) []string {
-	typeList := make([]string, 0, len(scanTypes))
-	for scanType := range scanTypes {
-		typeList = append(typeList, scanType)
-	}
-	return typeList
-}
-
 // calculateSeverity calculates severity based on scan characteristics
 func (m *VerticalScanModule) calculateSeverity(scanData *ScanData) string {
-	// High severity for stealth scans
-	if scanData.ScanTypes["syn"] || scanData.ScanTypes["fin"] ||
-		scanData.ScanTypes["xmas"] || scanData.ScanTypes["null"] ||
-		scanData.ScanTypes["fragmented"] {
-		return "high"
+	for _, scanType := range scanData.ScanTypes {
+		if scanType == "syn" || scanType == "fin" || scanType == "xmas" ||
+			scanType == "null" || scanType == "fragmented" {
+			return "high"
+		}
 	}
 
-	// Medium severity for many ports
 	if len(scanData.Ports) > 50 {
 		return "medium"
 	}

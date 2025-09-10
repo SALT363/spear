@@ -1,0 +1,52 @@
+[core]
+socket_path = "./build/spear.sock"
+plugin_dir = "./build/plugins"
+log_level = "debug"
+pid_file = "./build/spear.pid"
+
+[plugins]
+authwatch = { enabled = true }
+log = { enabled = true }
+
+# Triggers
+[[trigger]]
+id = "security_log_json"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/logs/security-events.json"
+format = "json"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "security_log_text"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/logs/security-events.log"
+format = "text"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "security_log_csv"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/logs/security-events.csv"
+format = "csv"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "auth_failures_only"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/logs/auth-failures.json"
+format = "json"
+timestamp = true
+append = true
+
+# Instances
+[[authwatch]]
+id = "ssh_monitor"
+services = ["ssh"]
+triggers = ["security_log_json", "security_log_text", "security_log_csv"]

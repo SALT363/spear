@@ -98,7 +98,7 @@ func (l *simpleLogger) log(level, msg string, args ...interface{}) {
 		for k, v := range allFields {
 			fieldsStr += fmt.Sprintf("%s=%v ", k, v)
 		}
-		fieldsStr = fmt.Sprintf("| %s", fieldsStr)
+		fieldsStr = fmt.Sprintf(" (%s)", fieldsStr)
 	}
 
 	fmt.Fprintf(os.Stdout, "%s [%s] %s%s%s\n", timestamp, level, prefixPart, msg, fieldsStr)

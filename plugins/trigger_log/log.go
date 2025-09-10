@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 
@@ -141,14 +142,14 @@ func (p *LogPlugin) RegisterTriggers() []api.TriggerDefinition {
 		{
 			Name:        "log_file",
 			Description: "Logs trigger arguments to a file",
-			ConfigType:  nil, // Will be set dynamically
+			ConfigType:  reflect.TypeOf(LogTriggerConfig{}), // Will be set dynamically
 			Factory:     p.createLogTrigger,
 		},
 	}
 }
 
 // createLogTrigger creates a new log trigger instance
-func (p *LogPlugin) createLogTrigger(config interface{}) (api.TriggerInstance, error) {
+func (p *LogPlugin) createLogTrigger(config any) (api.TriggerInstance, error) {
 	configMap, ok := config.(map[string]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid config format for log trigger")

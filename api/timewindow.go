@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// AsyncTimeWindowTracker manages time-based tracking with async processing
-type AsyncTimeWindowTracker[T any] struct {
+// TimeWindowTracker manages time-based tracking with  processing
+type TimeWindowTracker[T any] struct {
 	entries     sync.Map // Using sync.Map for lock-free reads
 	timeWindow  time.Duration
 	maxHits     int
@@ -38,7 +38,7 @@ type TrackingEvent[T any] struct {
 // Worker processes tracking events
 type Worker[T any] struct {
 	id      int
-	tracker *AsyncTimeWindowTracker[T]
+	tracker *TimeWindowTracker[T]
 	queue   chan *TrackingEvent[T]
 	stop    chan struct{}
 }
@@ -53,8 +53,8 @@ type TimeWindowEntry[T any] struct {
 	Metadata  sync.Map // Using sync.Map for metadata
 }
 
-// AsyncTimeWindowConfig configures the async tracker
-type AsyncTimeWindowConfig struct {
+// TimeWindowConfig configures the  tracker
+type TimeWindowConfig struct {
 	TimeWindow      time.Duration
 	MaxHits         int
 	CleanupInterval time.Duration
@@ -62,12 +62,12 @@ type AsyncTimeWindowConfig struct {
 	NumWorkers      int // Number of worker goroutines
 }
 
-// NewAsyncTimeWindowTracker creates a new async time window tracker
-func NewAsyncTimeWindowTracker[T any](
-	config AsyncTimeWindowConfig,
+// NewTimeWindowTracker creates a new  time window tracker
+func NewTimeWindowTracker[T any](
+	config TimeWindowConfig,
 	onThreshold func(key string, entry *TimeWindowEntry[T]),
 	logger Logger,
-) *AsyncTimeWindowTracker[T] {
+) *TimeWindowTracker[T] {
 	// Set defaults
 	if config.QueueSize == 0 {
 		config.QueueSize = 10000
@@ -82,7 +82,7 @@ func NewAsyncTimeWindowTracker[T any](
 		}
 	}
 
-	tracker := &AsyncTimeWindowTracker[T]{
+	tracker := &TimeWindowTracker[T]{
 		timeWindow:  config.TimeWindow,
 		maxHits:     config.MaxHits,
 		onThreshold: onThreshold,
@@ -95,8 +95,8 @@ func NewAsyncTimeWindowTracker[T any](
 	return tracker
 }
 
-// Start starts the async tracker
-func (awt *AsyncTimeWindowTracker[T]) Start() {
+// Start starts the  tracker
+func (awt *TimeWindowTracker[T]) Start() {
 	// Start worker pool
 	awt.workerPool = make([]*Worker[T], awt.numWorkers)
 	for i := 0; i < awt.numWorkers; i++ {
@@ -121,13 +121,13 @@ func (awt *AsyncTimeWindowTracker[T]) Start() {
 	awt.cleanupTicker = time.NewTicker(cleanupInterval)
 	go awt.cleanupLoop()
 
-	awt.logger.Debug("AsyncTimeWindowTracker started",
+	awt.logger.Debug("TimeWindowTracker started",
 		"workers", awt.numWorkers,
 		"queue_size", cap(awt.eventQueue))
 }
 
-// Stop stops the async tracker
-func (awt *AsyncTimeWindowTracker[T]) Stop() {
+// Stop stops the  tracker
+func (awt *TimeWindowTracker[T]) Stop() {
 	close(awt.stopChan)
 
 	// Stop workers
@@ -139,11 +139,11 @@ func (awt *AsyncTimeWindowTracker[T]) Stop() {
 		awt.cleanupTicker.Stop()
 	}
 
-	awt.logger.Debug("AsyncTimeWindowTracker stopped")
+	awt.logger.Debug("TimeWindowTracker stopped")
 }
 
 // Track adds an event to the queue (non-blocking)
-func (awt *AsyncTimeWindowTracker[T]) Track(key string, data T, metadata map[string]interface{}) bool {
+func (awt *TimeWindowTracker[T]) Track(key string, data T, metadata map[string]interface{}) bool {
 	event := &TrackingEvent[T]{
 		Key:       key,
 		Data:      data,
@@ -164,7 +164,7 @@ func (awt *AsyncTimeWindowTracker[T]) Track(key string, data T, metadata map[str
 }
 
 // eventDispatcher distributes events to workers using round-robin
-func (awt *AsyncTimeWindowTracker[T]) eventDispatcher() {
+func (awt *TimeWindowTracker[T]) eventDispatcher() {
 	workerIndex := 0
 
 	for {
@@ -282,7 +282,7 @@ func (w *Worker[T]) copyEntry(entry *TimeWindowEntry[T]) *TimeWindowEntry[T] {
 }
 
 // Get retrieves an entry (lock-free)
-func (awt *AsyncTimeWindowTracker[T]) Get(key string) (*TimeWindowEntry[T], bool) {
+func (awt *TimeWindowTracker[T]) Get(key string) (*TimeWindowEntry[T], bool) {
 	value, exists := awt.entries.Load(key)
 	if !exists {
 		return nil, false
@@ -313,7 +313,7 @@ func (awt *AsyncTimeWindowTracker[T]) Get(key string) (*TimeWindowEntry[T], bool
 }
 
 // cleanupLoop removes expired entries
-func (awt *AsyncTimeWindowTracker[T]) cleanupLoop() {
+func (awt *TimeWindowTracker[T]) cleanupLoop() {
 	for {
 		select {
 		case <-awt.cleanupTicker.C:
@@ -324,7 +324,7 @@ func (awt *AsyncTimeWindowTracker[T]) cleanupLoop() {
 	}
 }
 
-func (awt *AsyncTimeWindowTracker[T]) cleanup() {
+func (awt *TimeWindowTracker[T]) cleanup() {
 	now := time.Now()
 	cutoff := now.Add(-awt.timeWindow)
 	removed := 0
@@ -344,7 +344,7 @@ func (awt *AsyncTimeWindowTracker[T]) cleanup() {
 }
 
 // GetStats returns performance statistics
-func (awt *AsyncTimeWindowTracker[T]) GetStats() map[string]interface{} {
+func (awt *TimeWindowTracker[T]) GetStats() map[string]interface{} {
 	entryCount := 0
 	awt.entries.Range(func(key, value interface{}) bool {
 		entryCount++

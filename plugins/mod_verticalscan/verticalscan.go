@@ -44,7 +44,7 @@ type VerticalScanModule struct {
 	api            api.CoreAPI
 	logger         api.Logger
 	handle         *afpacket.TPacket
-	tracker        *api.AsyncTimeWindowTracker[*ScanData]
+	tracker        *api.TimeWindowTracker[*ScanData]
 	running        bool
 	stopChan       chan struct{}
 	waitGroup      sync.WaitGroup
@@ -95,7 +95,7 @@ func (p *VerticalScanPlugin) Meta() api.PluginMeta {
 		DisplayName: "Vertical Port Scan Detector",
 		Author:      "Spear Team",
 		Repository:  "https://github.com/sammwyy/spear",
-		Description: "Detects vertical port scans and stealth scans using AF_PACKET with async time window tracking",
+		Description: "Detects vertical port scans and stealth scans using AF_PACKET with  time window tracking",
 		Version:     "3.0.0",
 	}
 }
@@ -166,7 +166,7 @@ func (p *VerticalScanPlugin) RegisterModules() []api.ModuleDefinition {
 	return []api.ModuleDefinition{
 		{
 			Name:        "verticalscan",
-			Description: "Vertical port scan detection module with async time window tracking",
+			Description: "Vertical port scan detection module with  time window tracking",
 			ConfigType:  reflect.TypeOf(VerticalScanConfig{}),
 			Factory:     p.createVerticalScanModule,
 		},
@@ -216,7 +216,7 @@ func (p *VerticalScanPlugin) createVerticalScanModule(config interface{}) (api.M
 		ipCacheTTL: 5 * time.Minute,
 	}
 
-	trackerConfig := api.AsyncTimeWindowConfig{
+	trackerConfig := api.TimeWindowConfig{
 		TimeWindow:      time.Duration(cfg.TimeWindow) * time.Second,
 		MaxHits:         cfg.MaxPings,
 		CleanupInterval: time.Duration(cfg.CleanupInterval) * time.Second,
@@ -224,7 +224,7 @@ func (p *VerticalScanPlugin) createVerticalScanModule(config interface{}) (api.M
 		NumWorkers:      cfg.NumWorkers,
 	}
 
-	module.tracker = api.NewAsyncTimeWindowTracker(
+	module.tracker = api.NewTimeWindowTracker(
 		trackerConfig,
 		module.onThresholdReached,
 		module.logger,
@@ -580,7 +580,7 @@ func (m *VerticalScanModule) isConnectionInitiation(tcp *layers.TCP) bool {
 	return tcp.SYN && !tcp.ACK
 }
 
-// trackScanAttempt tracks a scan attempt using the async time window tracker
+// trackScanAttempt tracks a scan attempt using the  time window tracker
 func (m *VerticalScanModule) trackScanAttempt(srcIP string, dstPort int, protocol string, scanType ScanType, isFragmented bool) {
 	scanData := &ScanData{
 		IP:           srcIP,

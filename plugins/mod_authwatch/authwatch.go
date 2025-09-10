@@ -36,7 +36,7 @@ type AuthWatchModule struct {
 	api      api.CoreAPI
 	logger   api.Logger
 	services map[string]*ServiceDefinition
-	tracker  *api.AsyncTimeWindowTracker[*AuthData]
+	tracker  *api.TimeWindowTracker[*AuthData]
 }
 
 // AuthData represents authentication data for tracking
@@ -85,7 +85,7 @@ func (p *AuthWatchPlugin) Meta() api.PluginMeta {
 		DisplayName: "Authentication Watcher",
 		Author:      "Spear Team",
 		Repository:  "https://github.com/sammwyy/spear",
-		Description: "Monitors authentication logs for successful and failed login attempts with async time window tracking",
+		Description: "Monitors authentication logs for successful and failed login attempts with  time window tracking",
 		Version:     "2.0.0",
 	}
 }
@@ -161,7 +161,7 @@ func (p *AuthWatchPlugin) RegisterModules() []api.ModuleDefinition {
 	return []api.ModuleDefinition{
 		{
 			Name:        "authwatch",
-			Description: "Authentication monitoring module with async time window tracking",
+			Description: "Authentication monitoring module with  time window tracking",
 			ConfigType:  nil,
 			Factory:     p.createAuthWatchModule,
 		},
@@ -216,8 +216,8 @@ func (p *AuthWatchPlugin) createAuthWatchModule(config interface{}) (api.ModuleI
 		}
 	}
 
-	// Initialize async time window tracker
-	trackerConfig := api.AsyncTimeWindowConfig{
+	// Initialize  time window tracker
+	trackerConfig := api.TimeWindowConfig{
 		TimeWindow:      time.Duration(cfg.TimeWindow) * time.Second,
 		MaxHits:         cfg.MaxHits,
 		CleanupInterval: time.Duration(cfg.CleanupInterval) * time.Second,
@@ -225,7 +225,7 @@ func (p *AuthWatchPlugin) createAuthWatchModule(config interface{}) (api.ModuleI
 		NumWorkers:      cfg.NumWorkers,
 	}
 
-	module.tracker = api.NewAsyncTimeWindowTracker[*AuthData](
+	module.tracker = api.NewTimeWindowTracker[*AuthData](
 		trackerConfig,
 		module.onThresholdReached,
 		module.logger,
@@ -317,7 +317,7 @@ func (m *AuthWatchModule) Start() error {
 		"queue_size", m.config.QueueSize,
 		"workers", m.config.NumWorkers)
 
-	// Start async time window tracker
+	// Start  time window tracker
 	m.tracker.Start()
 
 	// Register file watchers for each service
@@ -377,11 +377,11 @@ func (m *AuthWatchModule) HandleEvent(event api.Event) error {
 		"user", authEvent.User,
 		"ip", authEvent.IP)
 
-	// Track the authentication event asynchronously
+	// Track the authentication event hronously
 	return m.trackAuthEvent(authEvent)
 }
 
-// trackAuthEvent tracks an authentication event using the async time window tracker
+// trackAuthEvent tracks an authentication event using the  time window tracker
 func (m *AuthWatchModule) trackAuthEvent(authEvent *AuthEvent) error {
 	// Skip if no IP address found
 	if authEvent.IP == "" {
@@ -415,7 +415,7 @@ func (m *AuthWatchModule) trackAuthEvent(authEvent *AuthEvent) error {
 		"raw_line":   authEvent.RawLine,
 	}
 
-	// Track asynchronously - this will never block the file watcher
+	// Track hronously - this will never block the file watcher
 	queued := m.tracker.Track(authEvent.IP, authData, metadata)
 	if !queued {
 		m.logger.Debug("Auth tracking event dropped due to full queue",

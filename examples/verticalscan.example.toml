@@ -1,0 +1,70 @@
+[core]
+socket_path = "/var/run/spear.sock"
+plugin_dir = "/usr/lib/spear/plugins"
+log_level = "debug"
+pid_file = "/var/run/spear.pid"
+
+[plugins]
+verticalscan = { enabled = true }
+log = { enabled = true }
+
+# Trigger for port scan alerts
+[[trigger]]
+id = "portscan_alert"
+plugin = "log"
+action = "log_file"
+file = "/var/log/spear/portscan-alerts.json"
+format = "json"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "portscan_text"
+plugin = "log"
+action = "log_file"
+file = "/var/log/spear/portscan-alerts.log"
+format = "text"
+timestamp = true
+append = true
+
+# Vertical port scan detection configuration
+[[verticalscan]]
+id = "eth0_monitor"
+interface = "eth0"                             # Network interface to monitor
+protocols = ["tcp", "udp"]                     # Protocols to monitor
+time_window = 30                               # Time window in seconds
+max_pings = 10                                 # Maximum pings before alerting
+port_mode = "blacklist"                        # "whitelist" or "blacklist"
+ports = []                                     # Empty list with blacklist = all ports
+cleanup_interval = 60                          # Cleanup every 60 seconds
+triggers = ["portscan_alert", "portscan_text"]
+detect_stealth = true                          # Detect stealth scans
+detect_fragmented = true                       # Detect fragmented packets
+
+# Example for monitoring only specific ports
+[[verticalscan]]
+id = "critical_ports"
+interface = "eth0"
+protocols = ["tcp"]
+time_window = 15                  # Shorter window for critical ports
+max_pings = 5                     # Fewer pings to alert
+port_mode = "whitelist"
+ports = [22, 80, 443, 3389, 5432] # Only these ports
+cleanup_interval = 30
+triggers = ["portscan_alert"]
+detect_stealth = true
+detect_fragmented = true
+
+# Example for ignoring common ports (blacklist)
+[[verticalscan]]
+id = "ignore_common"
+interface = "lo"
+protocols = ["tcp", "udp"]
+time_window = 60
+max_pings = 20
+port_mode = "blacklist"
+ports = [80, 443, 53, 22]    # Ignore these common ports
+cleanup_interval = 120
+triggers = ["portscan_text"]
+detect_stealth = true
+detect_fragmented = false

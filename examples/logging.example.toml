@@ -50,3 +50,5 @@ append = true
 id = "ssh_monitor"
 services = ["ssh"]
 triggers = ["security_log_json", "security_log_text", "security_log_csv"]
+time_window = 30
+max_hits = 1

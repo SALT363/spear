@@ -120,10 +120,25 @@ func (d *Daemon) processConfiguration() error {
 	// Process trigger configurations
 	for _, triggerConfig := range d.config.Triggers {
 		fullTriggerName := fmt.Sprintf("%s.%s", triggerConfig.Plugin, triggerConfig.Action)
-		if err := d.triggerReg.CreateInstance(triggerConfig.ID, fullTriggerName, triggerConfig.Config); err != nil {
-			d.logger.Error("Failed to create trigger instance", "id", triggerConfig.ID, "error", err)
+
+		triggerConfigMap := triggerConfig.GetTriggerConfig()
+
+		d.logger.Debug("Creating trigger instance",
+			"id", triggerConfig.ID,
+			"trigger", fullTriggerName,
+			"config", triggerConfigMap)
+
+		if err := d.triggerReg.CreateInstance(triggerConfig.ID, fullTriggerName, triggerConfigMap); err != nil {
+			d.logger.Error("Failed to create trigger instance",
+				"id", triggerConfig.ID,
+				"trigger", fullTriggerName,
+				"error", err)
 			continue
 		}
+
+		d.logger.Info("Created trigger instance",
+			"id", triggerConfig.ID,
+			"trigger", fullTriggerName)
 	}
 
 	// Process plugin-specific configurations

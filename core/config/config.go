@@ -41,7 +41,20 @@ type TriggerConfig struct {
 	ID     string                 `toml:"id"`
 	Plugin string                 `toml:"plugin"`
 	Action string                 `toml:"action"`
-	Config map[string]interface{} `toml:",omitempty"`
+	Extra  map[string]interface{} `toml:",omitempty"`
+}
+
+// GetTriggerConfig returns the complete configuration for a trigger
+func (tc *TriggerConfig) GetTriggerConfig() map[string]interface{} {
+	config := make(map[string]interface{})
+
+	for key, value := range tc.Extra {
+		if key != "id" && key != "plugin" && key != "action" {
+			config[key] = value
+		}
+	}
+
+	return config
 }
 
 // DefaultConfig returns a configuration with sensible defaults
@@ -100,19 +113,45 @@ func loadConfigFile(path string, config *Config) error {
 		return fmt.Errorf("config file does not exist: %s", path)
 	}
 
+	var rawConfig map[string]interface{}
+	if _, err := toml.DecodeFile(path, &rawConfig); err != nil {
+		return fmt.Errorf("failed to decode raw config: %w", err)
+	}
+
+	if triggersRaw, exists := rawConfig["trigger"]; exists {
+		if triggerSlice, ok := triggersRaw.([]map[string]interface{}); ok {
+			for _, triggerMap := range triggerSlice {
+				triggerConfig := TriggerConfig{
+					Extra: make(map[string]interface{}),
+				}
+
+				if id, exists := triggerMap["id"]; exists {
+					triggerConfig.ID = fmt.Sprintf("%v", id)
+				}
+				if plugin, exists := triggerMap["plugin"]; exists {
+					triggerConfig.Plugin = fmt.Sprintf("%v", plugin)
+				}
+				if action, exists := triggerMap["action"]; exists {
+					triggerConfig.Action = fmt.Sprintf("%v", action)
+				}
+
+				for key, value := range triggerMap {
+					if key != "id" && key != "plugin" && key != "action" {
+						triggerConfig.Extra[key] = value
+					}
+				}
+
+				config.Triggers = append(config.Triggers, triggerConfig)
+			}
+		}
+	}
+
 	var tempConfig Config
 	if _, err := toml.DecodeFile(path, &tempConfig); err != nil {
 		return fmt.Errorf("failed to decode config file %s: %w", path, err)
 	}
 
-	// Merge configurations
 	mergeConfigs(config, &tempConfig)
-
-	// Also decode into raw map for plugin-specific configurations
-	var rawConfig map[string]interface{}
-	if _, err := toml.DecodeFile(path, &rawConfig); err != nil {
-		return fmt.Errorf("failed to decode raw config: %w", err)
-	}
 
 	for key, value := range rawConfig {
 		if !isReservedConfigKey(key) {
@@ -146,9 +185,6 @@ func mergeConfigs(config, tempConfig *Config) {
 
 	// Append includes
 	config.Include = append(config.Include, tempConfig.Include...)
-
-	// Append triggers
-	config.Triggers = append(config.Triggers, tempConfig.Triggers...)
 }
 
 // isReservedConfigKey checks if a config key is reserved for core use

@@ -149,11 +149,15 @@ func (p *LogPlugin) RegisterTriggers() []api.TriggerDefinition {
 }
 
 // createLogTrigger creates a new log trigger instance
-func (p *LogPlugin) createLogTrigger(config any) (api.TriggerInstance, error) {
+func (p *LogPlugin) createLogTrigger(config interface{}) (api.TriggerInstance, error) {
+	p.logger.Debug("Creating log trigger with config", "config", config)
+
 	configMap, ok := config.(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("invalid config format for log trigger")
+		return nil, fmt.Errorf("invalid config format for log trigger, expected map[string]interface{}, got %T", config)
 	}
+
+	p.logger.Debug("Config map contents", "map", configMap)
 
 	// Parse configuration
 	var cfg LogTriggerConfig
@@ -161,15 +165,19 @@ func (p *LogPlugin) createLogTrigger(config any) (api.TriggerInstance, error) {
 	// Required: file path
 	if file, exists := configMap["file"]; exists {
 		cfg.File = fmt.Sprintf("%v", file)
+		p.logger.Debug("Found file config", "file", cfg.File)
 	} else {
+		p.logger.Error("Missing file parameter in config", "available_keys", getMapKeys(configMap))
 		return nil, fmt.Errorf("log trigger config must specify 'file' parameter")
 	}
 
 	// Optional: format (default: json)
 	if format, exists := configMap["format"]; exists {
 		cfg.Format = fmt.Sprintf("%v", format)
+		p.logger.Debug("Found format config", "format", cfg.Format)
 	} else {
 		cfg.Format = "json"
+		p.logger.Debug("Using default format", "format", cfg.Format)
 	}
 
 	// Optional: timestamp (default: true)
@@ -177,10 +185,18 @@ func (p *LogPlugin) createLogTrigger(config any) (api.TriggerInstance, error) {
 		if ts, ok := timestamp.(bool); ok {
 			cfg.Timestamp = ts
 		} else {
-			cfg.Timestamp = true
+			if tsStr := fmt.Sprintf("%v", timestamp); tsStr == "true" {
+				cfg.Timestamp = true
+			} else if tsStr == "false" {
+				cfg.Timestamp = false
+			} else {
+				cfg.Timestamp = true
+			}
 		}
+		p.logger.Debug("Found timestamp config", "timestamp", cfg.Timestamp)
 	} else {
 		cfg.Timestamp = true
+		p.logger.Debug("Using default timestamp", "timestamp", cfg.Timestamp)
 	}
 
 	// Optional: append (default: true)
@@ -188,13 +204,23 @@ func (p *LogPlugin) createLogTrigger(config any) (api.TriggerInstance, error) {
 		if app, ok := append.(bool); ok {
 			cfg.Append = app
 		} else {
-			cfg.Append = true
+			if appStr := fmt.Sprintf("%v", append); appStr == "true" {
+				cfg.Append = true
+			} else if appStr == "false" {
+				cfg.Append = false
+			} else {
+				cfg.Append = true
+			}
 		}
+		p.logger.Debug("Found append config", "append", cfg.Append)
 	} else {
 		cfg.Append = true
+		p.logger.Debug("Using default append", "append", cfg.Append)
 	}
 
-	// Validate config
+	p.logger.Info("Final log trigger config", "file", cfg.File, "format", cfg.Format, "timestamp", cfg.Timestamp, "append", cfg.Append)
+
+	// Validate config using the map directly
 	if err := p.ValidateConfig(configMap); err != nil {
 		return nil, err
 	}
@@ -214,6 +240,15 @@ func (p *LogPlugin) createLogTrigger(config any) (api.TriggerInstance, error) {
 
 	p.logger.Debug("Created log trigger", "id", trigger.id, "file", cfg.File, "format", cfg.Format)
 	return trigger, nil
+}
+
+// Helper function to get map keys for debugging
+func getMapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // LogTrigger methods

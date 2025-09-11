@@ -1,0 +1,127 @@
+[core]
+socket_path = "./build/spear.sock"
+plugin_dir = "./build/plugins"
+log_level = "debug"
+pid_file = "./build/spear.pid"
+
+[plugins]
+userwatch = { enabled = true }
+log = { enabled = true }
+
+# Trigger for user change alerts
+[[trigger]]
+id = "user_change_alert"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/log/userwatch/user-changes.json"
+format = "json"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "user_change_text"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/log/userwatch/user-changes.log"
+format = "text"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "critical_user_alert"
+plugin = "log"
+action = "log_file"
+file = "./build/tmp/log/userwatch/critical-user-changes.json"
+format = "json"
+timestamp = true
+append = true
+
+# Basic user monitoring configuration
+[[userwatch]]
+id = "basic_monitor"
+watch_users = true
+watch_groups = true
+watch_passwords = true
+user_mode = "blacklist"                              # Monitor all users except those in user_list
+user_list = ["nobody", "daemon"]                     # Blacklist system accounts
+min_uid = 1000                                       # Only monitor UIDs >= 1000
+max_uid = 65533                                      # Only monitor UIDs <= 65533
+ignore_system_users = true                           # Ignore system users (UID < 1000)
+passwd_file = "/etc/passwd"                          # Path to passwd file
+shadow_file = "/etc/shadow"                          # Path to shadow file
+group_file = "/etc/group"                            # Path to group file
+check_interval = 5                                   # Check every 5 seconds
+include_file_content = false                         # Don't include full file content
+triggers = ["user_change_alert", "user_change_text"]
+
+# Critical users monitoring (whitelist mode)
+[[userwatch]]
+id = "critical_users"
+watch_users = true
+watch_groups = true
+watch_passwords = true
+user_mode = "whitelist"                                # Only monitor specific users
+user_list = ["root", "admin", "backup"]                # Critical users to monitor
+min_uid = 0                                            # Monitor all UIDs for critical users
+max_uid = 65535
+ignore_system_users = false                            # Don't ignore system users for critical monitoring
+passwd_file = "/etc/passwd"
+shadow_file = "/etc/shadow"
+group_file = "/etc/group"
+check_interval = 2                                     # More frequent checking for critical users
+include_file_content = true                            # Include full file content for forensics
+triggers = ["critical_user_alert", "user_change_text"]
+
+# Password-only monitoring
+[[userwatch]]
+id = "password_monitor"
+watch_users = false              # Don't watch user additions/removals
+watch_groups = false             # Don't watch group changes
+watch_passwords = true           # Only watch password changes
+user_mode = "blacklist"
+user_list = ["guest", "test"]    # Don't monitor test accounts
+min_uid = 1000
+max_uid = 65533
+ignore_system_users = true
+passwd_file = "/etc/passwd"
+shadow_file = "/etc/shadow"
+group_file = "/etc/group"
+check_interval = 3
+include_file_content = false
+triggers = ["user_change_alert"]
+
+# Group-only monitoring
+[[userwatch]]
+id = "group_monitor"
+watch_users = false             # Don't watch user changes
+watch_groups = true             # Only watch group changes
+watch_passwords = false         # Don't watch password changes
+user_mode = "blacklist"
+user_list = []                  # Empty blacklist = monitor all
+min_uid = 0
+max_uid = 65535
+ignore_system_users = false
+passwd_file = "/etc/passwd"
+shadow_file = "/etc/shadow"
+group_file = "/etc/group"
+check_interval = 10             # Less frequent for group changes
+include_file_content = false
+triggers = ["user_change_text"]
+
+# Development environment monitoring (relaxed)
+[[userwatch]]
+id = "dev_monitor"
+watch_users = true
+watch_groups = true
+watch_passwords = false                          # Don't monitor password changes in dev
+user_mode = "whitelist"
+user_list = ["developer", "devuser", "testuser"] # Only monitor dev users
+min_uid = 1000
+max_uid = 2000                                   # Limited UID range for dev users
+ignore_system_users = true
+passwd_file = "/etc/passwd"
+shadow_file = "/etc/shadow"
+group_file = "/etc/group"
+check_interval = 30                              # Less frequent in development
+include_file_content = false
+triggers = ["user_change_alert"]

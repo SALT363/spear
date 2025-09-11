@@ -23,6 +23,10 @@
     - 🔦 VerticalScan: Watch for vertical port scanning
         - Detects SYN scan, FIN scan, Xmas tree, Null scan, Fragmented packets.
         - Configurable hits and timewindow.
+    - 🔑 Userwatch: Watch for user changes.
+        - Detect user creation/deletion.
+        - Detect group changes.
+        - Detect password changes.
 - **Triggers:**
     - 👁 Logs: Log all activity to .csv, .json or .log file.
 
@@ -31,7 +35,7 @@
 - [ ] More modules (flooding, suspicious TTL, IP source routing, fragmented spoofing, DNS tunneling, more authwatch protocols: RDP, FTP, SMTP, MySQL..., heuristic, iptables/nftables integration, syslog)
 - [ ] More triggers (email/SMTP, Discord, Telegram, Slack)
 - [ ] A dashboard? (ELK stack, Grafana, Prometheus)
-- [ ] Critical integrity check (/etc/passwd, /etc/shadow) log changes and more
+- [X] Critical integrity check (/etc/passwd, /etc/shadow) log changes and more
 - [ ] AIDE hash check
 - [ ] Detect suspicious processes (nc -l, bash -i >&, reverse shell-like commands)
 - [ ] Detect weird cwd processes (/tmp, /dev/shm)

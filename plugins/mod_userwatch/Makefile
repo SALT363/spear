@@ -1,4 +1,4 @@
-PLUGIN_NAME = trigger_log
+PLUGIN_NAME = mod_userwatch
 OUTPUT_DIR = ../../build/plugins
 PLUGIN_FILE = $(OUTPUT_DIR)/$(PLUGIN_NAME).so
 
@@ -8,7 +8,7 @@ GOFLAGS = -buildmode=plugin
 LDFLAGS = -w -s
 
 # Source files
-SOURCES = log.go
+SOURCES = userwatch.go
 
 .PHONY: all build clean install
 

